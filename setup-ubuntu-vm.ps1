@@ -132,6 +132,22 @@ function Resolve-UbuntuVersion($req) {
         if ($bestStr) { return $bestStr } else { throw "none" }
     } catch { Warn "Could not read release metadata. Falling back to 26.04."; return "26.04" }
 }
+function Get-Sha256WithProgress([string]$path, [string]$label) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    # ReadWrite sharing: the ISO may be attached to a VM at the same time.
+    $fs = [IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+    try {
+        $buf = New-Object byte[] (4MB); $total = [math]::Max(1, $fs.Length); $done = [int64]0; $last = -1
+        while (($n = $fs.Read($buf, 0, $buf.Length)) -gt 0) {
+            [void]$sha.TransformBlock($buf, 0, $n, $null, 0); $done += $n
+            $pct = [int][math]::Floor($done * 100 / $total)
+            if ($pct -ne $last) { $last = $pct; $w = (Get-Width) - 1; Write-Host ("`r" + ("  {0,3}%   {1}" -f $pct, $label).PadRight($w)) -NoNewline }
+        }
+        [void]$sha.TransformFinalBlock($buf, 0, 0)
+    } finally { $fs.Dispose() }
+    Microsoft.PowerShell.Utility\Write-Host ""
+    return ([BitConverter]::ToString($sha.Hash) -replace '-', '')
+}
 function Get-UbuntuIso($UbuntuVersion, $WorkDir) {
     $ver = Resolve-UbuntuVersion $UbuntuVersion
     Info "Latest Ubuntu: $ver"
@@ -147,10 +163,10 @@ function Get-UbuntuIso($UbuntuVersion, $WorkDir) {
     if (-not $isoName) { throw "No desktop ISO found for Ubuntu $ver." }
     Info "ISO: $isoName"
     $isoPath = Join-Path $WorkDir $isoName; $url = "$base/$isoName"
-    function Test-IsoHash($p, $hh) { (Test-Path $p) -and ((Get-FileHash $p -Algorithm SHA256).Hash -eq $hh.ToUpper()) }
+    function Test-IsoHash($p, $hh, $label) { (Test-Path $p) -and ((Get-Sha256WithProgress $p $label) -eq $hh.ToUpper()) }
     $verified = $false
     for ($a = 1; $a -le 2 -and -not $verified; $a++) {
-        if (Test-IsoHash $isoPath $hash) { OK "ISO present and verified, skipping download."; $verified = $true; break }
+        if (Test-IsoHash $isoPath $hash "checking the saved ISO's checksum") { OK "ISO present and verified, skipping download."; $verified = $true; break }
         if ($a -eq 2) { Warn "Retrying download once..." }
         Info "Downloading $isoName (about 6 GB)"
         try {
@@ -180,8 +196,7 @@ function Get-UbuntuIso($UbuntuVersion, $WorkDir) {
             & curl.exe -L --fail -o $isoPath $url
             if ($LASTEXITCODE -ne 0) { Warn "curl failed."; continue }
         }
-        Info "Verifying checksum (about a minute)..."
-        if (Test-IsoHash $isoPath $hash) { OK "Checksum OK."; $verified = $true } else { Warn "Checksum mismatch."; Remove-Item $isoPath -Force -ErrorAction SilentlyContinue }
+        if (Test-IsoHash $isoPath $hash "verifying the download's checksum") { OK "Checksum OK."; $verified = $true } else { Warn "Checksum mismatch."; Remove-Item $isoPath -Force -ErrorAction SilentlyContinue }
     }
     if (-not $verified) { throw "Could not obtain a valid ISO after 2 attempts." }
     return [pscustomobject]@{ Path = $isoPath; Name = $isoName; Version = $ver }
@@ -427,6 +442,9 @@ function Ensure-Switch {
     return $sw
 }
 # ---- install progress (host-side signals only: we can't see inside the installer) ----------
+# A typical installed Ubuntu Desktop takes about this much disk. It turns bytes written into an
+# estimated %, capped at 99% until the VM powers off (the installer itself reports nothing).
+$script:ExpectedInstallBytes = 10GB
 function New-InstallProgress { @{ Start = Get-Date; LastBytes = [int64]0; LastGrowth = Get-Date; Phase = $null; LastLog = Get-Date; OnLine = $false } }
 function Update-InstallProgress($t, $cpu, [int64]$bytes) {
     # Rules: almost nothing written yet and the CPU idle for 2+ minutes means the installer is
@@ -438,12 +456,13 @@ function Update-InstallProgress($t, $cpu, [int64]$bytes) {
     $phase = if ($bytes -lt 512MB) { if ($el.TotalMinutes -ge 2 -and $low) { 'waiting' } else { 'starting' } }
              elseif ($idleMin -ge 5 -and $low) { 'idle' } else { 'installing' }
     $cpuTxt = if ($null -ne $cpu) { "CPU {0,3}%   " -f $cpu } else { '' }
-    $status = "{0:hh\:mm\:ss}   {1}{2} written" -f $el, $cpuTxt, (Format-Size $bytes)
+    $pct = [math]::Min(99, [int][math]::Floor($bytes * 100 / $script:ExpectedInstallBytes))
+    $status = "{0:hh\:mm\:ss}   ~{1,2}%   {2}{3} written" -f $el, $pct, $cpuTxt, (Format-Size $bytes)
     if ($phase -ne $t.Phase) {
         if ($t.OnLine) { Microsoft.PowerShell.Utility\Write-Host ""; $t.OnLine = $false }
         switch ($phase) {
             'starting'   { Info "Starting the installer..." }
-            'installing' { Info "Installing: Ubuntu is being written to the disk ($(Format-Size $bytes) so far)." }
+            'installing' { Info "Installing: Ubuntu is being written to the disk. The % is an estimate from what has been written so far." }
             'waiting'    { Warn "Nothing written to the disk yet. The installer may be asking something in the VM window. If it asks to start the automated install, choose yes." }
             'idle'       { Warn "No disk activity for $idleMin min. Look at the VM window: it may be waiting for you, or just finishing up." }
         }
