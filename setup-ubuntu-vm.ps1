@@ -442,9 +442,6 @@ function Ensure-Switch {
     return $sw
 }
 # ---- install progress (host-side signals only: we can't see inside the installer) ----------
-# A typical installed Ubuntu Desktop takes about this much disk. It turns bytes written into an
-# estimated %, capped at 99% until the VM powers off (the installer itself reports nothing).
-$script:ExpectedInstallBytes = 10GB
 function New-InstallProgress { @{ Start = Get-Date; LastBytes = [int64]0; LastGrowth = Get-Date; Phase = $null; LastLog = Get-Date; OnLine = $false } }
 function Update-InstallProgress($t, $cpu, [int64]$bytes) {
     # Rules: almost nothing written yet and the CPU idle for 2+ minutes means the installer is
@@ -456,13 +453,12 @@ function Update-InstallProgress($t, $cpu, [int64]$bytes) {
     $phase = if ($bytes -lt 512MB) { if ($el.TotalMinutes -ge 2 -and $low) { 'waiting' } else { 'starting' } }
              elseif ($idleMin -ge 5 -and $low) { 'idle' } else { 'installing' }
     $cpuTxt = if ($null -ne $cpu) { "CPU {0,3}%   " -f $cpu } else { '' }
-    $pct = [math]::Min(99, [int][math]::Floor($bytes * 100 / $script:ExpectedInstallBytes))
-    $status = "{0:hh\:mm\:ss}   ~{1,2}%   {2}{3} written" -f $el, $pct, $cpuTxt, (Format-Size $bytes)
+    $status = "{0:hh\:mm\:ss}   {1}{2} written" -f $el, $cpuTxt, (Format-Size $bytes)
     if ($phase -ne $t.Phase) {
         if ($t.OnLine) { Microsoft.PowerShell.Utility\Write-Host ""; $t.OnLine = $false }
         switch ($phase) {
             'starting'   { Info "Starting the installer..." }
-            'installing' { Info "Installing: Ubuntu is being written to the disk. The % is an estimate from what has been written so far." }
+            'installing' { Info "Installing: Ubuntu is being written to the disk ($(Format-Size $bytes) so far)." }
             'waiting'    { Warn "Nothing written to the disk yet. The installer may be asking something in the VM window. If it asks to start the automated install, choose yes." }
             'idle'       { Warn "No disk activity for $idleMin min. Look at the VM window: it may be waiting for you, or just finishing up." }
         }
