@@ -501,10 +501,15 @@ function Try-Step([string]$what, [scriptblock]$do) {
     try { $null = & $do; return $true } catch { Warn "Couldn't $what ($($_.Exception.Message))."; return $false }
 }
 function Show-VMWindow([string]$name, [string]$kind) {
-    # Bring the VM's window to the front, or open it if it was closed. Opening a second Hyper-V
-    # window would ask "another user is connected", so raise the existing one first.
-    $title = if ($kind -eq 'hv') { "$name on localhost" } else { "$name [" }
-    try { if ((New-Object -ComObject WScript.Shell).AppActivate($title)) { return $true } } catch {}
+    # Bring the VM's window to the front, or open it only if none is open. Windows may refuse to
+    # raise a window, and opening a second Hyper-V one asks "another user is connected", so an
+    # already-open window counts as shown even when it couldn't be raised.
+    $title = if ($kind -eq 'hv') { "$name on *" } else { "$name `[*" }
+    $open = @(Get-Process -Name $(if ($kind -eq 'hv') { 'vmconnect' } else { 'VirtualBoxVM', 'VirtualBox' }) -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -like $title })
+    if ($open) {
+        try { [void](New-Object -ComObject WScript.Shell).AppActivate($open[0].Id) } catch {}
+        return $true
+    }
     if ($kind -eq 'hv') { try { Start-Process vmconnect.exe -ArgumentList 'localhost', $name; return $true } catch {} }
     return $false
 }
