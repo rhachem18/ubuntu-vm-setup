@@ -865,6 +865,70 @@ function Invoke-Doctor {
     Write-Host ""
     if ($issues) { Warn "$issues thing(s) worth a look." } else { OK "Everything looks healthy." }
 }
+function Invoke-Rename {
+    # Renames the VM itself, never its disk files. Hyper-V leaves the folder alone too;
+    # VirtualBox moves its own folder and settings file along when they carry the old name
+    # (that's VirtualBox's behaviour, not ours), so we say which one applies.
+    $list = @()
+    foreach ($n in $hvVMs) { $list += [pscustomobject]@{ Name = $n; Where = 'Hyper-V' } }
+    foreach ($n in $vbVMs) { $list += [pscustomobject]@{ Name = $n; Where = 'VirtualBox' } }
+    if ($hasHyperVCmdlets -and -not $hvReadable) { Warn "Hyper-V VMs can't be read without Administrator, so only VirtualBox VMs are listed." }
+    if (-not $list) { Info "There are no VMs to rename."; return }
+    Info "This changes the VM's name only. The VM must be turned off."
+    for ($k = 0; $k -lt $list.Count; $k++) { Write-Host ("     [{0}] {1}  ({2})" -f ($k+1), $list[$k].Name, $list[$k].Where) }
+    $pick = $null
+    do {
+        $pk = (Ask "Which VM? Enter its number (Enter to go back)").Trim()
+        if (-not $pk) { return }
+        if ($pk -match '^\d+$' -and [int]$pk -ge 1 -and [int]$pk -le $list.Count) { $pick = $list[[int]$pk-1] } else { Warn "Enter a number from the list." }
+    } until ($pick)
+    $name = $pick.Name
+    try { $h = if ($pick.Where -eq 'Hyper-V') { Get-HvHealth $name } else { Get-VbHealth $name } }
+    catch { Warn "Can't read '$name' ($($_.Exception.Message)). Nothing renamed."; return }
+    if ($h.State -notin 'off', 'aborted') {
+        Warn "'$name' is $($h.State). Shut it down first (from inside Ubuntu), then try again."
+        if (-not $DryRun) { return }
+        Warn "(the real run would stop here; the dry run carries on)"
+    }
+    $new = $null
+    do {
+        $in = (Ask "New name for '$name' (Enter to go back)" -Secret vm).Trim()
+        if (-not $in) { return }
+        $bad = $null
+        if ($in -notmatch '^[A-Za-z0-9._-]+$' -or $in -match '^\.+$') { $bad = "Letters, digits, dot, dash or underscore only." }
+        elseif ($in -eq $name) { $bad = "That's already its name." }
+        elseif ((@($hvVMs) + @($vbVMs)) -contains $in) { $bad = "A VM named '$in' already exists." }
+        elseif (Test-Path -LiteralPath (Join-Path $WorkDir $in)) { $bad = "A folder named '$in' already exists in $WorkDir. Pick another name, or delete that folder first." }
+        if ($bad) { Warn $bad } else { $new = $in }
+    } until ($new)
+    if ($hasHyperVCmdlets -and -not $hvReadable) { Warn "Couldn't check Hyper-V for a VM already named '$new'." }
+
+    $dir = $h.Dirs | Select-Object -First 1
+    $diskLeaf = if ($h.DiskPath) { Split-Path $h.DiskPath -Leaf } else { $null }
+    $vbMovesDir = $pick.Where -eq 'VirtualBox' -and $dir -and ((Split-Path $dir -Leaf) -eq $name)
+    $newDir = if ($vbMovesDir) { Join-Path (Split-Path $dir -Parent) $new } else { $null }
+    Write-Host ""
+    if ($vbMovesDir) {
+        Info "VirtualBox also renames its folder to $newDir, and its settings file."
+        if ($diskLeaf) { Info "The disk file keeps its old name: $diskLeaf" }
+    } else {
+        Info "Its folder and disk files keep the old name$(if ($h.DiskPath) { ": $($h.DiskPath)" })."
+    }
+    if ((Ask "Rename the $($pick.Where) VM '$name' to '$new'? (y/n)") -notmatch '^(y|yes)$') { Info "Nothing renamed."; return }
+    if ($DryRun) {
+        Would "rename the $($pick.Where) VM '$name' to '$new'"
+        if ($vbMovesDir) { Would "let VirtualBox move its folder to $newDir" }
+        OK "Dry run: nothing was changed."
+        return
+    }
+    if ($pick.Where -eq 'Hyper-V') {
+        try { Get-VM -Name $name -ErrorAction Stop | Rename-VM -NewName $new -ErrorAction Stop; OK "Renamed '$name' to '$new'." }
+        catch { Warn "Hyper-V couldn't rename it: $($_.Exception.Message)" }
+    } else {
+        $rc = Native { & $vbManage modifyvm $name --name $new }
+        if ($rc -eq 0) { OK "Renamed '$name' to '$new'." } else { Warn "VirtualBox couldn't rename it (exit $rc). Nothing changed." }
+    }
+}
 function Update-Inventory {
     # Re-read every time the menu is shown, so it reflects what the last action changed.
     $script:vbManage = Get-VBoxManage
@@ -931,7 +995,7 @@ try {
         $mode = (Ask "Choice (1-$(if ($canMigrate) { 5 } else { 4 }) or q)").Trim().ToLower(); if (-not $mode) { $mode = '1' }
         if ($mode -in 'q', 'quit', 'exit') { break }
         elseif ($mode -eq '1') { Invoke-Create }
-        elseif ($mode -eq '2') { Section "Rename a VM"; Info "Not available yet." }
+        elseif ($mode -eq '2') { Section "Rename a VM"; Invoke-Rename }
         elseif ($mode -eq '3') { Section "Delete VMs or ISOs"; Remove-OldItems $WorkDir $vbManage $hvVMs $vbVMs $isos $DryRun }
         elseif ($mode -eq '4') { Section "Doctor: health check"; Invoke-Doctor }
         elseif ($mode -eq '5' -and $canMigrate) { Section "Move a VirtualBox VM to Hyper-V"; Invoke-Migrate }
