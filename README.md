@@ -21,22 +21,16 @@ accept or customize, and a clear summary before it builds anything.
   and the password replaced by placeholders (`<vm-1>`, `<user>`, `<password>`), so the log is
   safe to share when asking for help.
 
-It opens on a menu, and every action comes back to it:
+### If the name is already taken
 
-- **Create** a new Ubuntu VM (the guided flow above).
-- **Rename** a VM (it must be turned off). Only the name changes: Hyper-V keeps the folder and
-  disk files under the old name; VirtualBox moves its folder to the new name but keeps the
-  disk file name.
-- **Delete** VMs, leftover folders and ISOs: pick several at once (for example `1,3` or `2-4`),
-  with sizes shown and a confirmation. Deleting everything needs a typed `yes`.
-- **Doctor**: a read-only health check of every VM. It flags unfinished installs (a near-empty
-  disk), install media still attached, leftover install files that can hold the password in
-  plain text, missing snapshots, VirtualBox running on the slow hypervisor path, and folders
-  no VM uses.
+The script checks the name against **both** Hyper-V and VirtualBox, and against the folder
+`VMs\<name>` (both hypervisors use that same folder). If anything is there, it lists exactly
+what replacing would delete, and you choose:
 
-The tool manages the VMs it creates, in `%USERPROFILE%\VMs` (change it with `-WorkDir`).
-VMs stored anywhere else are still listed, checked by Doctor and can be renamed or removed
-from their hypervisor, but files outside that folder are never deleted.
+- **[r] Replace**: the old VM, its disks and the folder are deleted, then the new VM is built.
+  This happens only after the new Ubuntu ISO is downloaded and verified, so a failed download
+  never costs you the old VM.
+- **[n] Change the name**: nothing is touched; type another name.
 
 ## Requirements
 
@@ -100,12 +94,11 @@ You set the password at a prompt when the script runs; it is never stored in the
 .\setup-ubuntu-vm.ps1 -DryRun
 ```
 
-This walks the whole wizard (checks, your existing VMs, the name and any clash, settings,
-account, summary) and then, instead of asking "Start the build?", prints exactly what it
-*would* do. Rename and delete are also only described. Nothing is created, deleted,
-converted or downloaded; only a `setup-log-*-dryrun.txt` log is written. It runs without
-Administrator too, but then Hyper-V VMs are invisible to it, so run it elevated to check
-name clashes against Hyper-V.
+This walks the whole wizard (checks, the name and any clash, settings, account, summary)
+and then, instead of asking "Start the build?", prints exactly what it *would* do, including
+anything a replace would delete. Nothing is created, deleted, converted or downloaded; only
+a `setup-log-*-dryrun.txt` log is written. It runs without Administrator too, but then
+Hyper-V VMs are invisible to it, so run it elevated to check name clashes against Hyper-V.
 
 ## After it finishes
 
@@ -117,6 +110,11 @@ name clashes against Hyper-V.
 - Reset to the clean install anytime:
   - Hyper-V: `Restore-VMCheckpoint -VMName <name> -Name clean -Confirm:$false`
   - VirtualBox: `VBoxManage snapshot <name> restore clean`
+
+## Tested so far
+
+The Hyper-V path is the main one and is being tested first. The VirtualBox path (for PCs with
+no hypervisor, such as Windows Home) has had less testing.
 
 ## A note on speed (Hyper-V vs VirtualBox)
 
@@ -141,7 +139,7 @@ When making the repo public, set these in the repo's **About** box.
 
 **Description:**
 
-> Guided PowerShell wizard to create a clean Ubuntu Desktop VM on Windows, auto-detecting Hyper-V or VirtualBox, with unattended install, health checks, and VM lifecycle management.
+> Guided PowerShell wizard to create a clean Ubuntu Desktop VM on Windows, auto-detecting Hyper-V or VirtualBox, with unattended install and a clean snapshot.
 
 **Topics:**
 
