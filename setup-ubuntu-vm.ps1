@@ -423,60 +423,6 @@ function Show-MigratePlan($src, $vbManage, $WorkDir, $MemoryMB, $Cpus) {
     Would "take a 'clean' checkpoint, start '$newName' and open its window"
     OK "The original VirtualBox VM '$src' would be left untouched."
 }
-function Remove-OldItems($WorkDir, $vbManage, $hvVMs, $vbVMs, $isos, [bool]$DryRun) {
-    Write-Host "   What to delete?"
-    Write-Host "     [i] ISO files only (frees space, forces re-download next time)"
-    Write-Host "     [v] A specific VM by name"
-    Write-Host "     [a] EVERYTHING under $WorkDir (all VMs + ISOs, keeps logs)"
-    Write-Host "     [n] Nothing, go back"
-    $d = (Ask "Choice (i/v/a/n)").Trim().ToLower()
-    $name = $null
-    if ($d -eq 'v') {
-        $name = (Ask "VM name to delete" -Secret vm).Trim()
-        # An empty name would make Join-Path point at $WorkDir itself and wipe every VM folder.
-        if (-not $name -or $name -notmatch '^[A-Za-z0-9._-]+$' -or $name -match '^\.+$') { Info "No valid VM name given. Nothing deleted."; return }
-    }
-    if ($DryRun) {
-        switch ($d) {
-            'i' { if ($isos) { foreach ($i in $isos) { Would ("delete {0} ({1:N0} MB)" -f $i.Name, ($i.Length/1MB)) } } else { Info "No ISOs to delete." } }
-            'v' {
-                $any = $false
-                if ($hvVMs -contains $name) { Would "turn off and remove the Hyper-V VM '$name'"; $any = $true }
-                if ($vbManage -and ($vbVMs -contains $name)) { Would "power off and unregister the VirtualBox VM '$name', deleting its disks"; $any = $true }
-                $dir = Join-Path $WorkDir $name; if (Test-Path $dir) { Would "delete the folder $dir"; $any = $true }
-                if (-not $any) { Info "No VM or folder named '$name' found. Nothing would be deleted." }
-            }
-            'a' {
-                Warn "This permanently deletes ALL VMs and ISOs under $WorkDir."
-                if ((Ask "Type 'yes' to confirm") -ne 'yes') { Info "Skipped."; return }
-                foreach ($n in $hvVMs) { Would "turn off and remove the Hyper-V VM '$n'" }
-                foreach ($n in $vbVMs) { Would "power off and unregister the VirtualBox VM '$n', deleting its disks" }
-                foreach ($f in @(Get-ChildItem $WorkDir -Exclude "setup-log-*.txt" -ErrorAction SilentlyContinue)) { Would "delete $($f.FullName)" }
-                Info "Logs (setup-log-*.txt) would be kept."
-            }
-            default { Info "Nothing deleted." }
-        }
-        return
-    }
-    switch ($d) {
-        'i' { foreach ($i in $isos) { Remove-Item $i.FullName -Force -ErrorAction SilentlyContinue; Info "Deleted $($i.Name)" } }
-        'v' {
-            if ($hvVMs -contains $name) { Stop-VM $name -TurnOff -Force -ErrorAction SilentlyContinue; Remove-VM $name -Force -ErrorAction SilentlyContinue; Info "Removed Hyper-V VM $name" }
-            if ($vbManage -and ($vbVMs -contains $name)) { Native { & $vbManage controlvm $name poweroff } | Out-Null; Native { & $vbManage unregistervm $name --delete } | Out-Null; Info "Removed VirtualBox VM $name" }
-            $dir = Join-Path $WorkDir $name; if (Test-Path $dir) { Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue; Info "Removed folder $name" }
-        }
-        'a' {
-            Warn "This permanently deletes ALL VMs and ISOs under $WorkDir."
-            if ((Ask "Type 'yes' to confirm") -ne 'yes') { Info "Skipped."; return }
-            foreach ($n in $hvVMs) { Stop-VM $n -TurnOff -Force -ErrorAction SilentlyContinue; Remove-VM $n -Force -ErrorAction SilentlyContinue }
-            if ($vbManage) { foreach ($n in $vbVMs) { Native { & $vbManage controlvm $n poweroff } | Out-Null; Native { & $vbManage unregistervm $n --delete } | Out-Null } }
-            Get-ChildItem $WorkDir -Exclude "setup-log-*.txt" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-            Info "Deleted all VMs and ISOs (kept logs)."
-        }
-        default { Info "Nothing deleted." }
-    }
-}
-
 # ---- actions (each one returns to the main menu) ------------------------------
 # They read the run-wide facts ($hvEnabled, $vbManage, $hvVMs, $vbVMs, $isos, ...) set by the
 # flow below. Assignments inside a function stay local, so every Create starts from the
@@ -722,7 +668,7 @@ function Invoke-Migrate {
     Migrate-VBox $src $vbManage $WorkDir (Ensure-Switch) $MemoryMB $Cpus
 }
 # ---- doctor (read-only) ----------------------------------------------------------
-function Format-Size([double]$bytes) { if ($bytes -lt 1GB) { "{0:N0} MB" -f ($bytes/1MB) } else { "{0:N1} GB" -f ($bytes/1GB) } }
+function Format-Size([double]$bytes) { if ($bytes -gt 0 -and $bytes -lt 1MB) { "< 1 MB" } elseif ($bytes -lt 1GB) { "{0:N0} MB" -f ($bytes/1MB) } else { "{0:N1} GB" -f ($bytes/1GB) } }
 function Get-DiskUsedBytes([string]$dir, [string[]]$files) {
     # Disk bytes in the VM's own folder, so snapshot/checkpoint layers count too. If the disk
     # sits straight in WorkDir (or a drive root), only count the attached files, or we'd add up
@@ -855,7 +801,7 @@ function Invoke-Doctor {
         Write-Host ""; Write-Host "   Folders in $WorkDir that no VM uses" -ForegroundColor White
         foreach ($d in $orphans) {
             Add-Secret $d.Name 'vm'
-            $size = 0; foreach ($f in @(Get-ChildItem -LiteralPath $d.FullName -Recurse -File -ErrorAction SilentlyContinue)) { $size += $f.Length }
+            $size = Get-FolderBytes $d.FullName
             Warn ("{0} ({1}){2}" -f $d.Name, (Format-Size $size), $(if ($hvChecked -or -not $hasHyperVCmdlets) { '' } else { ", not used by VirtualBox; Hyper-V couldn't be checked" }))
             $issues++
         }
@@ -929,6 +875,141 @@ function Invoke-Rename {
         if ($rc -eq 0) { OK "Renamed '$name' to '$new'." } else { Warn "VirtualBox couldn't rename it (exit $rc). Nothing changed." }
     }
 }
+# ---- delete --------------------------------------------------------------------
+function Get-FolderBytes([string]$dir) {
+    $sum = 0; foreach ($f in @(Get-ChildItem -LiteralPath $dir -Recurse -File -Force -ErrorAction SilentlyContinue)) { $sum += $f.Length }; return $sum
+}
+function Get-TopDir([string]$p) {
+    # The folder directly inside WorkDir that holds $p, or $null if $p is outside WorkDir.
+    # Deletes only ever remove folders this returns, so they can't reach WorkDir itself or beyond.
+    if (-not $p) { return $null }
+    $root = [IO.Path]::GetFullPath($WorkDir).TrimEnd('\')
+    try { $full = [IO.Path]::GetFullPath($p).TrimEnd('\') } catch { return $null }
+    if (-not $full.StartsWith("$root\", [StringComparison]::OrdinalIgnoreCase)) { return $null }
+    $seg = $full.Substring($root.Length + 1).Split('\')[0]
+    if (-not $seg -or $seg -match '^\.+$') { return $null }
+    return (Join-Path $root $seg)
+}
+function Remove-SafeFolder([string]$dir) {
+    $top = Get-TopDir $dir
+    if (-not $top -or $top -ne $dir.TrimEnd('\')) { Warn "Not deleting ${dir}: it isn't a folder directly inside $WorkDir."; return }
+    if (-not (Test-Path -LiteralPath $dir)) { return }
+    if ($DryRun) { Would ("delete the folder {0} ({1})" -f $dir, (Format-Size (Get-FolderBytes $dir))); return }
+    Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $dir) { Warn "Some files in $dir couldn't be deleted (in use?). Close any VM window and try again." }
+    else { OK "Deleted the folder $dir" }
+}
+function Remove-VMItem($it, [string[]]$keepDirs) {
+    # Removes the VM from its hypervisor, then its own folder(s) in WorkDir, unless another VM
+    # still uses that folder (same-name VMs on both hypervisors share VMs\<name>).
+    $name = $it.Name
+    if ($it.Where -eq 'Hyper-V') {
+        if ($DryRun) { Would "turn off and remove the Hyper-V VM '$name' and its checkpoints" }
+        else {
+            try {
+                $vm = Get-VM -Name $name -ErrorAction Stop
+                if ("$($vm.State)" -ne 'Off') { Stop-VM -VM $vm -TurnOff -Force -ErrorAction Stop }
+                Remove-VM -VM $vm -Force -ErrorAction Stop
+                OK "Removed the Hyper-V VM '$name'."
+            } catch { Warn "Couldn't remove the Hyper-V VM '$name' ($($_.Exception.Message)). Its files were left alone."; return }
+        }
+    } else {
+        if ($DryRun) { Would "power off and unregister the VirtualBox VM '$name', deleting its disks" }
+        else {
+            if ($it.Health.Running) { Native { & $vbManage controlvm $name poweroff } | Out-Null; Start-Sleep -Seconds 2 }
+            $rc = Native { & $vbManage unregistervm $name --delete }
+            if ($rc -ne 0) { Warn "VirtualBox couldn't delete '$name' (exit $rc). Its files were left alone."; return }
+            OK "Removed the VirtualBox VM '$name' and its disks."
+        }
+    }
+    foreach ($d in $it.Dirs) {
+        if ($keepDirs -contains $d) { Info "Keeping the folder $d, because another VM uses it." }
+        else { Remove-SafeFolder $d }
+    }
+    if (-not $it.Dirs -and $it.Health.DiskPath) { Info "Its files in $(Split-Path $it.Health.DiskPath -Parent) are outside $WorkDir and are left in place." }
+}
+function Invoke-Delete {
+    # One numbered list of everything deletable, with sizes; pick several at once.
+    $vmItems = @(); $protect = @()
+    if ($hasHyperVCmdlets -and -not $hvReadable) { Warn "Hyper-V VMs can't be read without Administrator, so they aren't listed, and a folder below may belong to one." }
+    $all = @()
+    foreach ($n in $hvVMs) { $all += [pscustomobject]@{ Name = $n; Where = 'Hyper-V' } }
+    foreach ($n in $vbVMs) { $all += [pscustomobject]@{ Name = $n; Where = 'VirtualBox' } }
+    foreach ($v in $all) {
+        try { $h = if ($v.Where -eq 'Hyper-V') { Get-HvHealth $v.Name } else { Get-VbHealth $v.Name } }
+        catch { Warn "Can't read the $($v.Where) VM '$($v.Name)', so it isn't listed."; $protect += Get-TopDir (Join-Path $WorkDir $v.Name); continue }
+        $cands = @($h.Dirs); if ($h.DiskPath) { $cands += Split-Path $h.DiskPath -Parent }
+        $tops = @($cands | ForEach-Object { Get-TopDir $_ } | Where-Object { $_ } | Sort-Object -Unique)
+        $size = $h.UsedBytes
+        if ($tops) { $size = 0; foreach ($t in $tops) { $size += Get-FolderBytes $t } }
+        $vmItems += [pscustomobject]@{ Kind = 'vm'; Name = $v.Name; Where = $v.Where; Label = "$($v.Where) VM"; Size = $size; Dirs = $tops; Health = $h }
+    }
+    $used = @($vmItems | ForEach-Object { $_.Dirs }) + @($protect | Where-Object { $_ })
+    $items = @($vmItems)
+    foreach ($d in @(Get-ChildItem -LiteralPath $WorkDir -Directory -ErrorAction SilentlyContinue)) {
+        if ($used -contains $d.FullName) { continue }
+        Add-Secret $d.Name 'vm'
+        $items += [pscustomobject]@{ Kind = 'folder'; Name = $d.Name; Label = 'folder, no VM'; Size = (Get-FolderBytes $d.FullName); Dirs = @($d.FullName) }
+    }
+    foreach ($i in $isos) { $items += [pscustomobject]@{ Kind = 'iso'; Name = $i.Name; Label = 'ISO'; Size = $i.Length; Path = $i.FullName } }
+    if (-not $items) { Info "Nothing to delete."; return }
+
+    $w = [math]::Max(12, [math]::Min(34, ($items | ForEach-Object { $_.Name.Length } | Measure-Object -Maximum).Maximum))
+    for ($k = 0; $k -lt $items.Count; $k++) { Write-Host ("     [{0}] {1} {2,-16} {3,9}" -f ($k+1), $items[$k].Name.PadRight($w), $items[$k].Label, (Format-Size $items[$k].Size)) }
+    Write-Host "     [a] EVERYTHING under $WorkDir (keeps the logs)"
+    $sel = $null; $everything = $false
+    do {
+        $in = (Ask "Numbers to delete, like 1,3 or 2-4 (a = everything, Enter to go back)").Trim().ToLower()
+        if (-not $in) { return }
+        if ($in -eq 'a') { $everything = $true; break }
+        $idx = @(); $bad = $false
+        foreach ($tok in ($in -split '[,\s]+' | Where-Object { $_ })) {
+            if ($tok -match '^(\d+)-(\d+)$' -and [int]$Matches[1] -le [int]$Matches[2]) { $idx += [int]$Matches[1]..[int]$Matches[2] }
+            elseif ($tok -match '^\d+$') { $idx += [int]$tok }
+            else { $bad = $true }
+        }
+        if ($bad -or -not $idx -or ($idx | Where-Object { $_ -lt 1 -or $_ -gt $items.Count })) { Warn "Use numbers from the list (1 to $($items.Count)), separated by commas." }
+        else { $sel = @($idx | Sort-Object -Unique | ForEach-Object { $items[$_ - 1] }) }
+    } until ($sel)
+
+    if ($everything) {
+        Write-Host ""
+        Warn "This permanently deletes ALL VMs, folders and ISOs under $WorkDir (logs are kept)."
+        if ($hasHyperVCmdlets -and -not $hvReadable) { Warn "Hyper-V VMs couldn't be read, so they aren't included." }
+        if ((Ask "Type 'yes' to confirm") -ne 'yes') { Info "Nothing deleted."; return }
+        $done = @()
+        foreach ($it in $vmItems) { Remove-VMItem $it @(); $done += $it.Dirs }
+        foreach ($f in @(Get-ChildItem -LiteralPath $WorkDir -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike 'setup-log-*.txt' })) {
+            if ($done -contains $f.FullName) { continue }
+            if ($f.PSIsContainer) { Remove-SafeFolder $f.FullName }
+            elseif ($DryRun) { Would ("delete {0} ({1})" -f $f.FullName, (Format-Size $f.Length)) }
+            else { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue; if (Test-Path -LiteralPath $f.FullName) { Warn "Couldn't delete $($f.FullName)." } else { OK "Deleted $($f.Name)" } }
+        }
+        if ($DryRun) { OK "Dry run: nothing was changed." } else { Info "Logs (setup-log-*.txt) were kept." }
+        return
+    }
+
+    Write-Host ""
+    Write-Host "   You picked:"
+    $total = 0
+    foreach ($it in $sel) { Write-Host ("     {0} {1,-16} {2,9}" -f $it.Name.PadRight($w), $it.Label, (Format-Size $it.Size)); $total += $it.Size }
+    Write-Host ("     Frees about {0}" -f (Format-Size $total))
+    $keep = @($vmItems | Where-Object { $sel -notcontains $_ } | ForEach-Object { $_.Dirs })
+    foreach ($it in @($sel | Where-Object Kind -eq 'vm')) { foreach ($d in $it.Dirs) { if ($keep -contains $d) { Info "'$($it.Name)' shares $d with another VM; that folder will be kept." } } }
+    foreach ($it in @($sel | Where-Object Kind -eq 'iso')) { foreach ($v in $vmItems) { if ($v.Health.Media -contains $it.Name) { Warn "$($it.Name) is attached to '$($v.Name)'." } } }
+    if ((Ask "Delete these $($sel.Count) item(s)? This can't be undone. (y/n)") -notmatch '^(y|yes)$') { Info "Nothing deleted."; return }
+    foreach ($it in $sel) {
+        switch ($it.Kind) {
+            'vm'     { Remove-VMItem $it $keep }
+            'folder' { Remove-SafeFolder $it.Dirs[0] }
+            'iso'    {
+                if ($DryRun) { Would ("delete {0} ({1})" -f $it.Path, (Format-Size $it.Size)) }
+                else { Remove-Item -LiteralPath $it.Path -Force -ErrorAction SilentlyContinue; if (Test-Path -LiteralPath $it.Path) { Warn "Couldn't delete $($it.Name) (in use?)." } else { OK "Deleted $($it.Name)" } }
+            }
+        }
+    }
+    if ($DryRun) { OK "Dry run: nothing was changed." }
+}
 function Update-Inventory {
     # Re-read every time the menu is shown, so it reflects what the last action changed.
     $script:vbManage = Get-VBoxManage
@@ -987,7 +1068,7 @@ try {
         Write-Host "   What would you like to do?"
         Write-Host "     [1] Create a new Ubuntu VM (default)"
         Write-Host "     [2] Rename a VM"
-        Write-Host "     [3] Delete VMs or ISOs"
+        Write-Host "     [3] Delete VMs, folders or ISOs"
         Write-Host "     [4] Doctor: check the health of your VMs"
         $canMigrate = $hvEnabled -and $vbVMs
         if ($canMigrate) { Write-Host "     [5] Move a VirtualBox VM to Hyper-V (keeps the original)" }
@@ -996,7 +1077,7 @@ try {
         if ($mode -in 'q', 'quit', 'exit') { break }
         elseif ($mode -eq '1') { Invoke-Create }
         elseif ($mode -eq '2') { Section "Rename a VM"; Invoke-Rename }
-        elseif ($mode -eq '3') { Section "Delete VMs or ISOs"; Remove-OldItems $WorkDir $vbManage $hvVMs $vbVMs $isos $DryRun }
+        elseif ($mode -eq '3') { Section "Delete VMs, folders or ISOs"; Invoke-Delete }
         elseif ($mode -eq '4') { Section "Doctor: health check"; Invoke-Doctor }
         elseif ($mode -eq '5' -and $canMigrate) { Section "Move a VirtualBox VM to Hyper-V"; Invoke-Migrate }
         else { Warn "Pick one of the numbers shown, or q to quit." }

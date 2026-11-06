@@ -21,7 +21,19 @@ accept or customize, and a clear summary before it builds anything.
   and the password replaced by placeholders (`<vm-1>`, `<user>`, `<password>`), so the log is
   safe to share when asking for help.
 
-It can also move an existing VirtualBox VM onto Hyper-V, and clean up old VMs and ISOs.
+It opens on a menu, and every action comes back to it:
+
+- **Create** a new Ubuntu VM (the guided flow above).
+- **Rename** a VM (it must be turned off). Only the name changes: Hyper-V keeps the folder and
+  disk files under the old name; VirtualBox moves its folder to the new name but keeps the
+  disk file name.
+- **Delete** VMs, leftover folders and ISOs: pick several at once (for example `1,3` or `2-4`),
+  with sizes shown and a confirmation. Deleting everything needs a typed `yes`.
+- **Doctor**: a read-only health check of every VM. It flags unfinished installs (a near-empty
+  disk), install media still attached, leftover install files that can hold the password in
+  plain text, missing snapshots, VirtualBox running on the slow hypervisor path, and folders
+  no VM uses.
+- **Move** a VirtualBox VM onto Hyper-V (the original is kept).
 
 ## Requirements
 
@@ -87,7 +99,7 @@ You set the password at a prompt when the script runs; it is never stored in the
 
 This walks the whole wizard (checks, your existing VMs, the name and any clash, settings,
 account, summary) and then, instead of asking "Start the build?", prints exactly what it
-*would* do. Move and delete choices are also only described. Nothing is created, deleted,
+*would* do. Rename, delete and move are also only described. Nothing is created, deleted,
 converted or downloaded; only a `setup-log-*-dryrun.txt` log is written. It runs without
 Administrator too, but then Hyper-V VMs are invisible to it, so run it elevated to check
 name clashes against Hyper-V.
