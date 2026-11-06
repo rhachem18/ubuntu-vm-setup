@@ -190,7 +190,7 @@ function Get-UbuntuIso($UbuntuVersion, $WorkDir) {
 # ---- wizard helpers -------------------------------------------------------
 function Prompt-VMName($default) {
     do {
-        $in = Ask "VM name (press Enter to use $default)" -Secret vm
+        $in = Ask "VM name (press Enter to use: $default)" -Secret vm
         if ($in) { $default = $in.Trim() }
         $ok = $default -match '^[A-Za-z0-9._-]+$' -and $default -notmatch '^\.+$'
         if (-not $ok) { Warn "Letters, digits, dot, dash or underscore only (not just dots)." }
@@ -204,7 +204,7 @@ function Prompt-WorkDir($default) {
     $free = try { Format-Size ([IO.DriveInfo](Split-Path -Qualifier $default)).AvailableFreeSpace } catch { '?' }
     Info ("Recommended: {0}  ({1} free{2})" -f $default, $free, $(if ($defIso) { '; the Ubuntu ISO is already saved here' } else { '' }))
     while ($true) {
-        $in = (Ask "Folder (press Enter to use $default)").Trim().Trim('"')
+        $in = (Ask "Folder (press Enter to use: $default)").Trim().Trim('"')
         if (-not $in) { $in = $default }
         $in = [Environment]::ExpandEnvironmentVariables($in)
         if ($in -notmatch '^[A-Za-z]:\\') { Warn "Give a full path on a local drive, like D:\VMs."; continue }
@@ -222,7 +222,7 @@ function Prompt-WorkDir($default) {
 }
 function Prompt-Account($defaultUser) {
     do {
-        $in = Ask "Login username (press Enter to use $defaultUser)" -Secret user
+        $in = Ask "Login username (press Enter to use: $defaultUser)" -Secret user
         if ($in) { $defaultUser = $in.Trim() }
         $ok = $defaultUser -match '^[a-z][a-z0-9_-]*$'
         if (-not $ok) { Warn "Lowercase, start with a letter." }
@@ -293,7 +293,7 @@ function Show-SettingsTable($label, $mem, $cpu, $disk, $hostRam, $hostCpu) {
 }
 function Read-IntOr($prompt, $default, $min, $max) {
     while ($true) {
-        $in = (Ask ("$prompt (press Enter to use $default)")).Trim()
+        $in = (Ask ("$prompt (press Enter to use: $default)")).Trim()
         if (-not $in) { return $default }
         if ($in -match '^\d+$') {
             $v = [int]$in
@@ -323,7 +323,7 @@ function Choose-Settings($hostRam, $hostCpu, $defMem, $defCpu, $defDisk, $defVer
         $mem = Read-IntOr "Memory in MB, 1024 = 1 GB" $recMem 2048 $maxMem
         $cpu = Read-IntOr "Number of CPUs" $recCpu 1 $maxCpu
         $disk = Read-IntOr "Disk size in GB" $defDisk 25 4096
-        $verIn = (Ask "Ubuntu version: lts, latest or a number like 24.04 (press Enter to use $defVer)").Trim()
+        $verIn = (Ask "Ubuntu version: lts, latest or a number like 24.04 (press Enter to use: $defVer)").Trim()
         if (-not $verIn) { $verIn = $defVer }
         return [pscustomobject]@{ Mem = $mem; Cpu = $cpu; Disk = $disk; Ver = $verIn }
     }
