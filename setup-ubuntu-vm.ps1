@@ -428,7 +428,7 @@ function Remove-OldItems($WorkDir, $vbManage, $hvVMs, $vbVMs, $isos, [bool]$DryR
     Write-Host "     [i] ISO files only (frees space, forces re-download next time)"
     Write-Host "     [v] A specific VM by name"
     Write-Host "     [a] EVERYTHING under $WorkDir (all VMs + ISOs, keeps logs)"
-    Write-Host "     [n] Nothing, continue"
+    Write-Host "     [n] Nothing, go back"
     $d = (Ask "Choice (i/v/a/n)").Trim().ToLower()
     $name = $null
     if ($d -eq 'v') {
@@ -477,48 +477,17 @@ function Remove-OldItems($WorkDir, $vbManage, $hvVMs, $vbVMs, $isos, [bool]$DryR
     }
 }
 
-# ======================================================================= START
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin -and -not $DryRun) { throw "Please run PowerShell as Administrator, then run this again. (Or add -DryRun to rehearse without changing anything.)" }
-
-# Names known up front are secrets from the first line of the log.
-Add-Secret $VMName 'vm'; Add-Secret $Username 'user'
-
-# A dry run only writes its log, and only into a WorkDir that already exists.
-if (-not $DryRun) { New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null }
-if (Test-Path $WorkDir) {
-    $logPath = Join-Path $WorkDir ("setup-log-{0:yyyyMMdd-HHmmss}{1}.txt" -f (Get-Date), $(if ($DryRun) { '-dryrun' } else { '' }))
-    [IO.File]::WriteAllBytes($logPath, [byte[]](0xEF, 0xBB, 0xBF))
-    $script:LogPath = $logPath
-    Write-Log ("setup-ubuntu-vm log, started {0:yyyy-MM-dd HH:mm:ss}{1}, PowerShell {2}" -f (Get-Date), $(if ($DryRun) { ' (dry run)' } else { '' }), $PSVersionTable.PSVersion)
-    Write-Log "VM names, the login username and the password are replaced with <vm-N>, <user>, <password>."
-}
-
-$hasHyperVCmdlets = [bool](Get-Command New-VM -ErrorAction SilentlyContinue) -and [bool](Get-Command Get-VM -ErrorAction SilentlyContinue)
-$hvFeature = $null; try { $hvFeature = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction Stop } catch {}   # needs admin; HypervisorPresent covers it otherwise
-$hvFeatureOn = $hvFeature -and ("$($hvFeature.State)" -eq 'Enabled')
-$cs = Get-CimInstance Win32_ComputerSystem
-$hypervisorOn = [bool]$cs.HypervisorPresent
-$hvEnabled = $hasHyperVCmdlets -and ($hvFeatureOn -or $hypervisorOn)
-$hostRamMB = [int]($cs.TotalPhysicalMemory / 1MB); $hostCpus = [int]$cs.NumberOfLogicalProcessors
-$target = if ($hvEnabled) { "Hyper-V (fast on this PC)" } else { "VirtualBox" }
-
-try {
-    Section "Welcome - let's set up an Ubuntu virtual machine"
-    if ($DryRun) {
-        Write-Host "   DRY RUN: nothing will be created, deleted, converted or downloaded." -ForegroundColor Magenta
-        Write-Host "   The wizard stops before the build and prints what it would have done." -ForegroundColor Magenta
-        if (-not $isAdmin) { Warn "Not running as Administrator: Hyper-V VMs can't be listed, so clash checks only see VirtualBox." }
-    }
-    Info "This PC: $([math]::Round($hostRamMB/1024,1)) GB RAM, $hostCpus CPUs"
-    Info "Will build on: $target"
-
+# ---- actions (each one returns to the main menu) ------------------------------
+# They read the run-wide facts ($hvEnabled, $vbManage, $hvVMs, $vbVMs, $isos, ...) set by the
+# flow below. Assignments inside a function stay local, so every Create starts from the
+# command-line defaults again.
+function Invoke-Create {
     if (-not $hvEnabled -and $hypervisorOn) {
         Write-Host ""
         Warn "A hypervisor (likely VBS/Credential Guard) is on but Hyper-V is off, so VirtualBox will be slow here."
         Warn "For full speed, enable Hyper-V (one reboot) then rerun:"
         Write-Host "     dism /online /enable-feature /featurename:Microsoft-Hyper-V-All /all /norestart"
-        if ((Ask "Continue now with VirtualBox (slower)? (y/n)") -notmatch '^(y|yes)$') { throw "Stopped. Enable Hyper-V, reboot, then rerun." }
+        if ((Ask "Continue now with VirtualBox (slower)? (y/n)") -notmatch '^(y|yes)$') { Info "Stopped. Enable Hyper-V, reboot, then rerun."; return }
     }
 
     # ---- checks
@@ -538,42 +507,6 @@ try {
         $m = "No internet connection to releases.ubuntu.com. Check your connection and rerun."
         if ($DryRun) { Warn "$m (the real run would stop here)" } else { throw $m }
     }
-
-    # ---- inventory + what to do
-    Section "Your existing virtual machines"
-    $vbManage = Get-VBoxManage
-    $hvVMs = @(); $hvReadable = $true
-    if ($hasHyperVCmdlets) { try { $hvVMs = @(Get-VM -ErrorAction Stop | Select-Object -ExpandProperty Name) } catch { $hvReadable = $false } }
-    $vbVMs = @(); if ($vbManage) { $vbVMs = @((NativeOut { & $vbManage list vms }) | ForEach-Object { if ($_ -match '^"([^"]+)"') { $Matches[1] } }) }
-    $isos = @(Get-ChildItem (Join-Path $WorkDir "ubuntu-*.iso") -ErrorAction SilentlyContinue)
-    foreach ($n in @($hvVMs) + @($vbVMs)) { Add-Secret $n 'vm' }
-    if (-not $hvReadable) { Warn "Hyper-V VMs: can't read them (needs Administrator)" }
-    elseif ($hvVMs) { Info ("Hyper-V VMs: " + ($hvVMs -join ', ')) } else { Info "Hyper-V VMs: none" }
-    if ($vbVMs) { Info ("VirtualBox VMs: " + ($vbVMs -join ', ')) } else { Info "VirtualBox VMs: none" }
-    if ($isos) { foreach ($i in $isos) { Info ("Saved ISO: {0} ({1:N0} MB)" -f $i.Name, ($i.Length/1MB)) } } else { Info "Saved ISOs: none" }
-    Write-Host ""
-    Write-Host "   What would you like to do?"
-    Write-Host "     [c] Create a new Ubuntu VM (default)"
-    $canMigrate = $hvEnabled -and $vbVMs
-    if ($canMigrate) { Write-Host "     [m] Move a VirtualBox VM onto Hyper-V (keeps the original)" }
-    Write-Host "     [d] Delete old VMs or ISOs first"
-    $mode = (Ask "Choice (c$(if($canMigrate){'/m'})/d)").Trim().ToLower(); if (-not $mode) { $mode = 'c' }
-
-    if ($mode -eq 'm' -and $canMigrate) {
-        Write-Host "   VirtualBox VMs you can move:"
-        for ($k = 0; $k -lt $vbVMs.Count; $k++) { Write-Host ("     [{0}] {1}" -f ($k+1), $vbVMs[$k]) }
-        $src = $null
-        do {
-            $pk = (Ask "Enter the number or exact name").Trim()
-            if ($pk -match '^\d+$' -and [int]$pk -ge 1 -and [int]$pk -le $vbVMs.Count) { $src = $vbVMs[[int]$pk-1] }
-            elseif ($vbVMs -contains $pk) { $src = $pk } else { Warn "Enter a number from the list or the exact name." }
-        } until ($src)
-        Add-Secret "$src-hv" 'vm'
-        if ($DryRun) { Show-MigratePlan $src $vbManage $WorkDir $MemoryMB $Cpus; Write-Host ""; OK "Dry run finished. Nothing was changed."; return }
-        Migrate-VBox $src $vbManage $WorkDir (Ensure-Switch) $MemoryMB $Cpus
-        return
-    }
-    if ($mode -eq 'd') { Section "Delete old items"; Remove-OldItems $WorkDir $vbManage $hvVMs $vbVMs $isos $DryRun }
 
     # ---- name
     Section "Name your VM"
@@ -619,7 +552,7 @@ try {
         Write-Host ""; OK "Dry run finished at 'Start the build?'. Nothing was changed."
         return
     }
-    if ((Ask "Start the build? (y/n)") -notmatch '^(y|yes)$') { throw "No problem, stopped before building. Rerun whenever you're ready." }
+    if ((Ask "Start the build? (y/n)") -notmatch '^(y|yes)$') { Info "No problem, nothing was built."; return }
 
     $script:StepNo = 0; $script:StepTotal = 6
 
@@ -771,6 +704,96 @@ autoinstall:
         OK "Log in with username '$Username' and your password."
         Write-Host "   Reset: & `"$VBoxManage`" snapshot $VMName restore clean"
     }
+}
+function Invoke-Migrate {
+    if (-not $hvEnabled) { Info "Moving needs Hyper-V, which isn't enabled on this PC."; return }
+    if (-not $vbVMs) { Info "There are no VirtualBox VMs to move."; return }
+    Write-Host "   VirtualBox VMs you can move:"
+    for ($k = 0; $k -lt $vbVMs.Count; $k++) { Write-Host ("     [{0}] {1}" -f ($k+1), $vbVMs[$k]) }
+    $src = $null
+    do {
+        $pk = (Ask "Enter the number or exact name (Enter to go back)").Trim()
+        if (-not $pk) { return }
+        if ($pk -match '^\d+$' -and [int]$pk -ge 1 -and [int]$pk -le $vbVMs.Count) { $src = $vbVMs[[int]$pk-1] }
+        elseif ($vbVMs -contains $pk) { $src = $pk } else { Warn "Enter a number from the list or the exact name." }
+    } until ($src)
+    Add-Secret "$src-hv" 'vm'
+    if ($DryRun) { Show-MigratePlan $src $vbManage $WorkDir $MemoryMB $Cpus; Write-Host ""; OK "Dry run: nothing was changed."; return }
+    Migrate-VBox $src $vbManage $WorkDir (Ensure-Switch) $MemoryMB $Cpus
+}
+function Update-Inventory {
+    # Re-read every time the menu is shown, so it reflects what the last action changed.
+    $script:vbManage = Get-VBoxManage
+    $script:hvVMs = @(); $script:hvReadable = $true
+    if ($hasHyperVCmdlets) { try { $script:hvVMs = @(Get-VM -ErrorAction Stop | Select-Object -ExpandProperty Name) } catch { $script:hvReadable = $false } }
+    $script:vbVMs = @(); if ($script:vbManage) { $script:vbVMs = @((NativeOut { & $script:vbManage list vms }) | ForEach-Object { if ($_ -match '^"([^"]+)"') { $Matches[1] } }) }
+    $script:isos = @(Get-ChildItem (Join-Path $WorkDir "ubuntu-*.iso") -ErrorAction SilentlyContinue)
+    foreach ($n in @($script:hvVMs) + @($script:vbVMs)) { Add-Secret $n 'vm' }
+    if (-not $script:hvReadable) { Warn "Hyper-V VMs: can't read them (needs Administrator)" }
+    elseif ($script:hvVMs) { Info ("Hyper-V VMs: " + ($script:hvVMs -join ', ')) } else { Info "Hyper-V VMs: none" }
+    if ($script:vbVMs) { Info ("VirtualBox VMs: " + ($script:vbVMs -join ', ')) } else { Info "VirtualBox VMs: none" }
+    if ($script:isos) { foreach ($i in $script:isos) { Info ("Saved ISO: {0} ({1:N0} MB)" -f $i.Name, ($i.Length/1MB)) } } else { Info "Saved ISOs: none" }
+}
+
+# ======================================================================= START
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin -and -not $DryRun) { throw "Please run PowerShell as Administrator, then run this again. (Or add -DryRun to rehearse without changing anything.)" }
+
+# Names known up front are secrets from the first line of the log.
+Add-Secret $VMName 'vm'; Add-Secret $Username 'user'
+
+# A dry run only writes its log, and only into a WorkDir that already exists.
+if (-not $DryRun) { New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null }
+if (Test-Path $WorkDir) {
+    $logPath = Join-Path $WorkDir ("setup-log-{0:yyyyMMdd-HHmmss}{1}.txt" -f (Get-Date), $(if ($DryRun) { '-dryrun' } else { '' }))
+    [IO.File]::WriteAllBytes($logPath, [byte[]](0xEF, 0xBB, 0xBF))
+    $script:LogPath = $logPath
+    Write-Log ("setup-ubuntu-vm log, started {0:yyyy-MM-dd HH:mm:ss}{1}, PowerShell {2}" -f (Get-Date), $(if ($DryRun) { ' (dry run)' } else { '' }), $PSVersionTable.PSVersion)
+    Write-Log "VM names, the login username and the password are replaced with <vm-N>, <user>, <password>."
+}
+
+$hasHyperVCmdlets = [bool](Get-Command New-VM -ErrorAction SilentlyContinue) -and [bool](Get-Command Get-VM -ErrorAction SilentlyContinue)
+$hvFeature = $null; try { $hvFeature = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction Stop } catch {}   # needs admin; HypervisorPresent covers it otherwise
+$hvFeatureOn = $hvFeature -and ("$($hvFeature.State)" -eq 'Enabled')
+$cs = Get-CimInstance Win32_ComputerSystem
+$hypervisorOn = [bool]$cs.HypervisorPresent
+$hvEnabled = $hasHyperVCmdlets -and ($hvFeatureOn -or $hypervisorOn)
+$hostRamMB = [int]($cs.TotalPhysicalMemory / 1MB); $hostCpus = [int]$cs.NumberOfLogicalProcessors
+$target = if ($hvEnabled) { "Hyper-V (fast on this PC)" } else { "VirtualBox" }
+
+try {
+    Section "Welcome - let's set up an Ubuntu virtual machine"
+    if ($DryRun) {
+        Write-Host "   DRY RUN: nothing will be created, deleted, converted or downloaded." -ForegroundColor Magenta
+        Write-Host "   Each action prints what it would have done instead." -ForegroundColor Magenta
+        if (-not $isAdmin) { Warn "Not running as Administrator: Hyper-V VMs can't be listed, so clash checks only see VirtualBox." }
+    }
+    Info "This PC: $([math]::Round($hostRamMB/1024,1)) GB RAM, $hostCpus CPUs"
+    Info "Will build on: $target"
+
+    # ---- main menu: each action runs, then comes back here until you quit
+    while ($true) {
+        Section "Your virtual machines"
+        Update-Inventory
+        Write-Host ""
+        Write-Host "   What would you like to do?"
+        Write-Host "     [1] Create a new Ubuntu VM (default)"
+        Write-Host "     [2] Rename a VM"
+        Write-Host "     [3] Delete VMs or ISOs"
+        Write-Host "     [4] Doctor: check the health of your VMs"
+        $canMigrate = $hvEnabled -and $vbVMs
+        if ($canMigrate) { Write-Host "     [5] Move a VirtualBox VM to Hyper-V (keeps the original)" }
+        Write-Host "     [q] Quit"
+        $mode = (Ask "Choice (1-$(if ($canMigrate) { 5 } else { 4 }) or q)").Trim().ToLower(); if (-not $mode) { $mode = '1' }
+        if ($mode -in 'q', 'quit', 'exit') { break }
+        elseif ($mode -eq '1') { Invoke-Create }
+        elseif ($mode -eq '2') { Section "Rename a VM"; Info "Not available yet." }
+        elseif ($mode -eq '3') { Section "Delete VMs or ISOs"; Remove-OldItems $WorkDir $vbManage $hvVMs $vbVMs $isos $DryRun }
+        elseif ($mode -eq '4') { Section "Doctor"; Info "Not available yet." }
+        elseif ($mode -eq '5' -and $canMigrate) { Section "Move a VirtualBox VM to Hyper-V"; Invoke-Migrate }
+        else { Warn "Pick one of the numbers shown, or q to quit." }
+    }
+    Write-Host ""; OK "Bye."
 }
 catch {
     Write-Log ""; Write-Log ("STOPPED: " + $_.Exception.Message)
