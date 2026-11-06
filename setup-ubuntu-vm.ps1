@@ -174,7 +174,7 @@ function Get-UbuntuIso($UbuntuVersion, $WorkDir) {
                 Start-Sleep -Seconds 1
             }
             Complete-BitsTransfer $job
-            Write-Host "`r  100%   download complete                                        "
+            Write-Host ("`r" + ("  100%   download complete: {0:N0} MB in {1:mm\:ss}" -f ($job.BytesTotal/1MB), $sw.Elapsed)).PadRight((Get-Width) - 1)
         } catch {
             Write-Host "`nBITS unavailable ($($_.Exception.Message)). Trying curl..." -ForegroundColor Yellow
             & curl.exe -L --fail -o $isoPath $url
@@ -426,6 +426,35 @@ function Ensure-Switch {
     if (-not (Get-VMSwitch -Name $sw -ErrorAction SilentlyContinue)) { New-VMSwitch -Name $sw -NetAdapterName $nic.Name -AllowManagementOS $true | Out-Null }
     return $sw
 }
+# ---- install progress (host-side signals only: we can't see inside the installer) ----------
+function New-InstallProgress { @{ Start = Get-Date; LastBytes = [int64]0; LastGrowth = Get-Date; Phase = $null; LastLog = Get-Date; OnLine = $false } }
+function Update-InstallProgress($t, $cpu, [int64]$bytes) {
+    # Rules: almost nothing written yet and the CPU idle for 2+ minutes means the installer is
+    # probably waiting for an answer; a disk that stopped growing for 5+ minutes means a stall.
+    $now = Get-Date; $el = $now - $t.Start
+    if ($bytes -gt $t.LastBytes + 16MB) { $t.LastBytes = $bytes; $t.LastGrowth = $now }
+    $idleMin = [int][math]::Floor(($now - $t.LastGrowth).TotalMinutes)
+    $low = ($null -eq $cpu) -or ($cpu -lt 10)
+    $phase = if ($bytes -lt 512MB) { if ($el.TotalMinutes -ge 2 -and $low) { 'waiting' } else { 'starting' } }
+             elseif ($idleMin -ge 5 -and $low) { 'idle' } else { 'installing' }
+    $cpuTxt = if ($null -ne $cpu) { "CPU {0,3}%   " -f $cpu } else { '' }
+    $status = "{0:hh\:mm\:ss}   {1}{2} written" -f $el, $cpuTxt, (Format-Size $bytes)
+    if ($phase -ne $t.Phase) {
+        if ($t.OnLine) { Microsoft.PowerShell.Utility\Write-Host ""; $t.OnLine = $false }
+        switch ($phase) {
+            'starting'   { Info "Starting the installer..." }
+            'installing' { Info "Installing: Ubuntu is being written to the disk ($(Format-Size $bytes) so far)." }
+            'waiting'    { Warn "Nothing written to the disk yet. The installer may be asking something in the VM window. If it asks to start the automated install, choose yes." }
+            'idle'       { Warn "No disk activity for $idleMin min. Look at the VM window: it may be waiting for you, or just finishing up." }
+        }
+        $t.Phase = $phase; $t.LastLog = $now
+        Write-Log "   [$status]"
+    } elseif (($now - $t.LastLog).TotalMinutes -ge 5) { Write-Log "   [$status]  $phase"; $t.LastLog = $now }
+    $w = (Get-Width) - 1; $ln = "  $status   $phase"
+    if ($ln.Length -gt $w) { $ln = $ln.Substring(0, $w) }
+    Write-Host ("`r" + $ln.PadRight($w)) -NoNewline; $t.OnLine = $true
+}
+
 # ---- health check of the VM just built (read-only: it reports and suggests, never changes) ----
 function Problem([string]$msg, [string[]]$fix) {
     $script:HealthProblems++
@@ -710,15 +739,26 @@ autoinstall:
         Start-VM -Name $VMName | Out-Null; try { vmconnect.exe localhost $VMName } catch {}
         Warn "If the installer asks to start the automated install, select yes once, then leave it."
         Info "Installing. The VM powers off by itself when done..."
-        $start = Get-Date; $deadline = $start.AddMinutes(90); $done = $false
-        do { Start-Sleep -Seconds 15; $state = (Get-VM -Name $VMName).State; $w = (Get-Width) - 1; $ln = ("  {0:hh\:mm\:ss} elapsed, VM state: {1}" -f ((Get-Date)-$start), $state); if ($ln.Length -gt $w) { $ln = $ln.Substring(0,$w) }; Write-Host ("`r" + $ln.PadRight($w)) -NoNewline; if ($state -eq 'Off') { $done = $true; break } } while ((Get-Date) -lt $deadline)
-        Write-Host ""
+        $prog = New-InstallProgress; $deadline = $prog.Start.AddMinutes(90); $done = $false
+        do {
+            Start-Sleep -Seconds 15
+            $vmNow = Get-VM -Name $VMName
+            if ("$($vmNow.State)" -eq 'Off') { $done = $true; break }
+            # The system disk's current file (an .avhdx once a checkpoint exists), not the seed.
+            $osNow = $vmNow | Get-VMHardDiskDrive | Where-Object { $_.Path -notlike '*\seed*' } | Select-Object -First 1
+            Update-InstallProgress $prog ([int]$vmNow.CPUUsage) $(if ($osNow) { Get-VhdChainBytes $osNow.Path } else { 0 })
+        } while ((Get-Date) -lt $deadline)
+        Microsoft.PowerShell.Utility\Write-Host ""
         if (-not $done) { throw "Install did not finish within 90 minutes. Open the VM window to check; finish it, power off, then run: Checkpoint-VM -VMName $VMName -SnapshotName clean" }
+        OK ("Ubuntu installed in {0:hh\:mm\:ss}; the VM powered itself off." -f ((Get-Date) - $prog.Start))
+        Info "Ejecting the install ISO and the seed disk..."
         Get-VMDvdDrive -VMName $VMName | Remove-VMDvdDrive
         Get-VMHardDiskDrive -VMName $VMName | Where-Object Path -eq $seedVhd | Remove-VMHardDiskDrive
         Set-VMFirmware -VMName $VMName -FirstBootDevice (Get-VMHardDiskDrive -VMName $VMName | Select-Object -First 1)
         Remove-Item $seedVhd -Force -ErrorAction SilentlyContinue
+        Info "Taking the 'clean' checkpoint..."
         Checkpoint-VM -Name $VMName -SnapshotName "clean"
+        Info "Starting the VM and opening its window..."
         Start-VM -Name $VMName | Out-Null; try { vmconnect.exe localhost $VMName } catch {}
 
         Show-Done (Test-HvBuild $VMName $vmDir)
@@ -765,18 +805,34 @@ autoinstall:
         Step "Installing Ubuntu (automatic)"
         VBox unattended install $VMName --iso=$isoPath --user=$Username --password=$Password --full-user-name=$Username --hostname="$VMName.local" --locale=en_US --time-zone=$TimeZone --install-additions --start-vm=gui
         Info "Installing. This runs on its own..."
-        $start = Get-Date; $deadline = $start.AddMinutes(90); $installed = $false
-        do { Start-Sleep -Seconds 15; $ga = NativeOut { & $VBoxManage guestproperty get $VMName "/VirtualBox/GuestAdd/Version" }; $w = (Get-Width) - 1; $ln = ("  {0:hh\:mm\:ss} elapsed" -f ((Get-Date)-$start)); Write-Host ("`r" + $ln.PadRight($w)) -NoNewline; if ($ga -match '^Value:') { $installed = $true; break } } while ((Get-Date) -lt $deadline)
-        Write-Host ""
+        $prog = New-InstallProgress; $deadline = $prog.Start.AddMinutes(90); $installed = $false
+        do {
+            Start-Sleep -Seconds 15
+            $ga = NativeOut { & $VBoxManage guestproperty get $VMName "/VirtualBox/GuestAdd/Version" }
+            if ($ga -match '^Value:') { $installed = $true; break }
+            $bytes = [int64]0; foreach ($l in (NativeOut { & $VBoxManage showmediuminfo disk $vdiPath })) { if ($l -match '^Size on disk:\s*(\d+)\s*MBytes') { $bytes = [int64]$Matches[1] * 1MB } }
+            Update-InstallProgress $prog $null $bytes
+        } while ((Get-Date) -lt $deadline)
+        Microsoft.PowerShell.Utility\Write-Host ""
         if (-not $installed) { throw "Install did not complete within 90 minutes. Check the VM window." }
-        OK "Ubuntu installed."
+        OK ("Ubuntu installed in {0:hh\:mm\:ss}." -f ((Get-Date) - $prog.Start))
 
         Step "Saving a clean snapshot"
+        Info "Ejecting the install ISO..."
         VBox storageattach $VMName --storagectl SATA --port 1 --device 0 --type dvddrive --medium emptydrive
+        Info "Shutting Ubuntu down for the snapshot (up to 5 minutes)..."
         VBox controlvm $VMName acpipowerbutton
-        $deadline = (Get-Date).AddMinutes(5)
-        do { Start-Sleep -Seconds 5; $info = NativeOut { & $VBoxManage showvminfo $VMName --machinereadable }; $state = ($info | Select-String '^VMState=' | Select-Object -First 1).ToString(); if ((Get-Date) -gt $deadline) { VBox controlvm $VMName poweroff } } until ($state -match 'poweroff')
+        $sdStart = Get-Date; $deadline = $sdStart.AddMinutes(5); $forced = $false
+        do {
+            Start-Sleep -Seconds 5
+            $info = NativeOut { & $VBoxManage showvminfo $VMName --machinereadable }; $state = ($info | Select-String '^VMState=' | Select-Object -First 1).ToString()
+            $w = (Get-Width) - 1; Write-Host ("`r" + ("  {0:mm\:ss}   waiting for it to shut down" -f ((Get-Date) - $sdStart)).PadRight($w)) -NoNewline
+            if ((Get-Date) -gt $deadline -and -not $forced) { Microsoft.PowerShell.Utility\Write-Host ""; Warn "It didn't shut down in 5 minutes, so it is being powered off."; VBox controlvm $VMName poweroff; $forced = $true }
+        } until ($state -match 'poweroff')
+        Microsoft.PowerShell.Utility\Write-Host ""
+        Info "Taking the 'clean' snapshot..."
         VBox snapshot $VMName take clean --description "Clean Ubuntu install"
+        Info "Starting the VM..."
         VBox startvm $VMName --type gui
 
         Show-Done (Test-VbBuild $VMName $VBoxManage)
