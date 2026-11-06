@@ -442,25 +442,49 @@ function Ensure-Switch {
     return $sw
 }
 # ---- install progress (host-side signals only: we can't see inside the installer) ----------
-function New-InstallProgress { @{ Start = Get-Date; LastBytes = [int64]0; LastGrowth = Get-Date; Phase = $null; LastLog = Get-Date; OnLine = $false } }
+function Show-VMWindow([string]$name, [string]$kind) {
+    # Bring the VM's window to the front, or open it if it was closed. Opening a second Hyper-V
+    # window would ask "another user is connected", so raise the existing one first.
+    $title = if ($kind -eq 'hv') { "$name on localhost" } else { "$name [" }
+    try { if ((New-Object -ComObject WScript.Shell).AppActivate($title)) { return $true } } catch {}
+    if ($kind -eq 'hv') { try { Start-Process vmconnect.exe -ArgumentList 'localhost', $name; return $true } catch {} }
+    return $false
+}
+function New-InstallProgress([string]$name, [string]$kind) {
+    @{ Name = $name; Kind = $kind; Start = Get-Date; LastBytes = [int64]0; LastGrowth = Get-Date; Phase = $null; LastLog = Get-Date; LastNudge = Get-Date; OnLine = $false }
+}
 function Update-InstallProgress($t, $cpu, [int64]$bytes) {
-    # Rules: almost nothing written yet and the CPU idle for 2+ minutes means the installer is
-    # probably waiting for an answer; a disk that stopped growing for 5+ minutes means a stall.
+    # Rules: almost nothing written 4+ minutes in means the installer is waiting for you (an
+    # automated install starts writing within a couple of minutes); a disk that stopped growing
+    # for 5+ minutes with the CPU idle means a stall. Both bring the VM window up, and repeat
+    # the reminder every 10 minutes while it lasts.
     $now = Get-Date; $el = $now - $t.Start
     if ($bytes -gt $t.LastBytes + 16MB) { $t.LastBytes = $bytes; $t.LastGrowth = $now }
     $idleMin = [int][math]::Floor(($now - $t.LastGrowth).TotalMinutes)
     $low = ($null -eq $cpu) -or ($cpu -lt 10)
-    $phase = if ($bytes -lt 512MB) { if ($el.TotalMinutes -ge 2 -and $low) { 'waiting' } else { 'starting' } }
+    $phase = if ($bytes -lt 512MB) { if ($el.TotalMinutes -ge 4) { 'waiting' } else { 'starting' } }
              elseif ($idleMin -ge 5 -and $low) { 'idle' } else { 'installing' }
     $cpuTxt = if ($null -ne $cpu) { "CPU {0,3}%   " -f $cpu } else { '' }
     $status = "{0:hh\:mm\:ss}   {1}{2} written" -f $el, $cpuTxt, (Format-Size $bytes)
-    if ($phase -ne $t.Phase) {
+    $changed = $phase -ne $t.Phase
+    $nudge = -not $changed -and $phase -in 'waiting', 'idle' -and ($now - $t.LastNudge).TotalMinutes -ge 10
+    if ($changed -or $nudge) {
         if ($t.OnLine) { Microsoft.PowerShell.Utility\Write-Host ""; $t.OnLine = $false }
+        $mins = [int][math]::Floor($el.TotalMinutes)
         switch ($phase) {
             'starting'   { Info "Starting the installer..." }
             'installing' { Info "Installing: Ubuntu is being written to the disk ($(Format-Size $bytes) so far)." }
-            'waiting'    { Warn "Nothing written to the disk yet. The installer may be asking something in the VM window. If it asks to start the automated install, choose yes." }
-            'idle'       { Warn "No disk activity for $idleMin min. Look at the VM window: it may be waiting for you, or just finishing up." }
+            'waiting'    {
+                Warn "The automatic install hasn't started after $mins minutes. It needs you in the VM window:"
+                Write-Host "       - 'Ready to install' / 'Review your choices': click Install." -ForegroundColor Yellow
+                Write-Host "       - Asked whether to start the automated install: choose yes." -ForegroundColor Yellow
+                Write-Host "       - Anything else: tell whoever is helping you what the window shows." -ForegroundColor Yellow
+            }
+            'idle'       { Warn "No disk activity for $idleMin minutes. Look at the VM window: it may be waiting for you, or just finishing up." }
+        }
+        if ($phase -in 'waiting', 'idle') {
+            if (Show-VMWindow $t.Name $t.Kind) { Info "The VM window is open for you now." } else { Info "Open the VM window yourself (Hyper-V Manager or VirtualBox, double-click '$($t.Name)')." }
+            $t.LastNudge = $now
         }
         $t.Phase = $phase; $t.LastLog = $now
         Write-Log "   [$status]"
@@ -469,7 +493,6 @@ function Update-InstallProgress($t, $cpu, [int64]$bytes) {
     if ($ln.Length -gt $w) { $ln = $ln.Substring(0, $w) }
     Write-Host ("`r" + $ln.PadRight($w)) -NoNewline; $t.OnLine = $true
 }
-
 # ---- health check of the VM just built (read-only: it reports and suggests, never changes) ----
 function Problem([string]$msg, [string[]]$fix) {
     $script:HealthProblems++
@@ -752,9 +775,9 @@ autoinstall:
 
         Step "Installing Ubuntu"
         Start-VM -Name $VMName | Out-Null; try { vmconnect.exe localhost $VMName } catch {}
-        Warn "If the installer asks to start the automated install, select yes once, then leave it."
+        Warn "The installer may stop once on a 'Ready to install' screen: click Install there, then leave it."
         Info "Installing. The VM powers off by itself when done..."
-        $prog = New-InstallProgress; $deadline = $prog.Start.AddMinutes(90); $done = $false
+        $prog = New-InstallProgress $VMName 'hv'; $deadline = $prog.Start.AddMinutes(90); $done = $false
         do {
             Start-Sleep -Seconds 15
             $vmNow = Get-VM -Name $VMName
@@ -820,7 +843,7 @@ autoinstall:
         Step "Installing Ubuntu (automatic)"
         VBox unattended install $VMName --iso=$isoPath --user=$Username --password=$Password --full-user-name=$Username --hostname="$VMName.local" --locale=en_US --time-zone=$TimeZone --install-additions --start-vm=gui
         Info "Installing. This runs on its own..."
-        $prog = New-InstallProgress; $deadline = $prog.Start.AddMinutes(90); $installed = $false
+        $prog = New-InstallProgress $VMName 'vb'; $deadline = $prog.Start.AddMinutes(90); $installed = $false
         do {
             Start-Sleep -Seconds 15
             $ga = NativeOut { & $VBoxManage guestproperty get $VMName "/VirtualBox/GuestAdd/Version" }
