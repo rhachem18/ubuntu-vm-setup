@@ -497,6 +497,9 @@ function Ensure-Switch {
     return $sw
 }
 # ---- install progress (host-side signals only: we can't see inside the installer) ----------
+function Try-Step([string]$what, [scriptblock]$do) {
+    try { $null = & $do; return $true } catch { Warn "Couldn't $what ($($_.Exception.Message))."; return $false }
+}
 function Show-VMWindow([string]$name, [string]$kind) {
     # Bring the VM's window to the front, or open it if it was closed. Opening a second Hyper-V
     # window would ask "another user is connected", so raise the existing one first.
@@ -518,7 +521,8 @@ function Test-InstallTime($t) {
 function Update-InstallProgress($t, $cpu, [int64]$bytes) {
     # Rules: almost nothing written 4+ minutes in means the installer is waiting for you (an
     # automated install starts writing within a couple of minutes); a disk that stopped growing
-    # for 5+ minutes with the CPU idle means a stall. Both bring the VM window up, and repeat
+    # for 10+ minutes with the CPU idle means a stall (the last part of the install writes little,
+    # so 5 minutes gave false alarms). Both bring the VM window up, and repeat
     # the reminder every 10 minutes while it lasts.
     $now = Get-Date; $el = $now - $t.Start
     if ($bytes -gt $t.LastBytes + 16MB) { $t.LastBytes = $bytes; $t.LastGrowth = $now }
@@ -526,7 +530,7 @@ function Update-InstallProgress($t, $cpu, [int64]$bytes) {
     $idleMin = [int][math]::Floor(($now - $t.LastGrowth).TotalMinutes)
     $low = ($null -eq $cpu) -or ($cpu -lt 10)
     $phase = if ($bytes -lt 512MB) { if ($el.TotalMinutes -ge 4) { 'waiting' } else { 'starting' } }
-             elseif ($idleMin -ge 5 -and $low) { 'idle' } else { 'installing' }
+             elseif ($idleMin -ge 10 -and $low) { 'idle' } else { 'installing' }
     $cpuTxt = if ($null -ne $cpu) { "CPU {0,3}%   " -f $cpu } else { '' }
     $status = "{0:hh\:mm\:ss}   {1}{2} written" -f $el, $cpuTxt, (Format-Size $bytes)
     $changed = $phase -ne $t.Phase
@@ -876,17 +880,25 @@ autoinstall:
         }
         OK ("Ubuntu installed in {0:hh\:mm\:ss}; the VM powered itself off." -f ((Get-Date) - $prog.Start))
         Info "Ejecting the install ISO and the seed disk..."
-        Get-VMDvdDrive -VMName $VMName | Remove-VMDvdDrive
+        # Each finishing step is on its own: one failing must not skip the rest. The health
+        # check below reports anything left undone, with the command to fix it.
+        [void](Try-Step "eject the install ISO" {
+            # Ubuntu often ejects the disc itself at the end, and then removing the drive fails
+            # with "cannot be found". An empty drive is fine; only a drive still holding the ISO matters.
+            foreach ($d in @(Get-VMDvdDrive -VMName $VMName)) {
+                try { Remove-VMDvdDrive -VMDvdDrive $d -ErrorAction Stop } catch { if ($d.Path) { Set-VMDvdDrive -VMDvdDrive $d -Path $null -ErrorAction Stop } }
+            }
+        })
         # By pattern, not exact path: a checkpoint would point the drive at seed_<id>.avhdx.
-        Get-VMHardDiskDrive -VMName $VMName | Where-Object { $_.Path -like '*\seed*' } | Remove-VMHardDiskDrive
-        Set-VMFirmware -VMName $VMName -FirstBootDevice (Get-VMHardDiskDrive -VMName $VMName | Select-Object -First 1)
+        [void](Try-Step "detach the seed disk" { Get-VMHardDiskDrive -VMName $VMName | Where-Object { $_.Path -like '*\seed*' } | Remove-VMHardDiskDrive -ErrorAction Stop })
+        [void](Try-Step "set the system disk as the boot disk" { Set-VMFirmware -VMName $VMName -FirstBootDevice (Get-VMHardDiskDrive -VMName $VMName | Select-Object -First 1) -ErrorAction Stop })
         Remove-Item $seedVhd -Force -ErrorAction SilentlyContinue
         if (Test-Path -LiteralPath $seedVhd) { Warn "Couldn't delete $seedVhd; the health check below says how." }
         Info "Taking the 'clean' checkpoint..."
-        Checkpoint-VM -Name $VMName -SnapshotName "clean"
+        [void](Try-Step "take the 'clean' checkpoint" { Checkpoint-VM -Name $VMName -SnapshotName "clean" -ErrorAction Stop })
         Info "Starting the VM and bringing its window up..."
         # Raise the window that is already open; a second one would ask "another user is connected".
-        Start-VM -Name $VMName | Out-Null; [void](Show-VMWindow $VMName 'hv')
+        if (Try-Step "start the VM" { Start-VM -Name $VMName -ErrorAction Stop | Out-Null }) { [void](Show-VMWindow $VMName 'hv') }
 
         Show-Done (Test-HvBuild $VMName $vmDir)
         OK "'$VMName' (Ubuntu $UbuntuVersion) is on Hyper-V."
