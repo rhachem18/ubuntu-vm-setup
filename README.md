@@ -33,7 +33,10 @@ It opens on a menu, and every action comes back to it:
   disk), install media still attached, leftover install files that can hold the password in
   plain text, missing snapshots, VirtualBox running on the slow hypervisor path, and folders
   no VM uses.
-- **Move** a VirtualBox VM onto Hyper-V (the original is kept).
+
+The tool manages the VMs it creates, in `%USERPROFILE%\VMs` (change it with `-WorkDir`).
+VMs stored anywhere else are still listed, checked by Doctor and can be renamed or removed
+from their hypervisor, but files outside that folder are never deleted.
 
 ## Requirements
 
@@ -99,7 +102,7 @@ You set the password at a prompt when the script runs; it is never stored in the
 
 This walks the whole wizard (checks, your existing VMs, the name and any clash, settings,
 account, summary) and then, instead of asking "Start the build?", prints exactly what it
-*would* do. Rename, delete and move are also only described. Nothing is created, deleted,
+*would* do. Rename and delete are also only described. Nothing is created, deleted,
 converted or downloaded; only a `setup-log-*-dryrun.txt` log is written. It runs without
 Administrator too, but then Hyper-V VMs are invisible to it, so run it elevated to check
 name clashes against Hyper-V.

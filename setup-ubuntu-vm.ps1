@@ -10,7 +10,7 @@
     - hypervisor forced on (VBS) -> warns to enable Hyper-V; VirtualBox would be slow
     - no hypervisor              -> builds on VirtualBox (full speed)
   Shared: latest Ubuntu LTS, verified ISO download, clean snapshot, logging to
-  VMs\setup-log-*.txt. Hyper-V also offers migrating a VirtualBox VM and cleanup.
+  VMs\setup-log-*.txt. A menu also offers rename, delete and a health check (Doctor).
 
 .NOTES
   RUN (PowerShell as Administrator):
@@ -368,61 +368,6 @@ function Ensure-Switch {
     if (-not (Get-VMSwitch -Name $sw -ErrorAction SilentlyContinue)) { New-VMSwitch -Name $sw -NetAdapterName $nic.Name -AllowManagementOS $true | Out-Null }
     return $sw
 }
-function Migrate-VBox($src, $vbManage, $WorkDir, $switchName, $MemoryMB, $Cpus) {
-    $newName = "$src-hv"
-    if (Get-VM -Name $newName -ErrorAction SilentlyContinue) { throw "A Hyper-V VM '$newName' already exists. Delete it first." }
-    $vdi = Get-ChildItem (Join-Path $WorkDir "$src\*.vdi") -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $vdi) { throw "Could not find the disk (.vdi) for '$src' under $WorkDir\$src." }
-    $script:StepNo = 0; $script:StepTotal = 3
-    Step "Converting '$src' disk to Hyper-V format"
-    Native { & $vbManage controlvm $src poweroff } | Out-Null; Start-Sleep -Seconds 3
-    $newDir = Join-Path $WorkDir $newName; New-Item -ItemType Directory -Force -Path $newDir | Out-Null
-    $vhd = Join-Path $newDir "$newName.vhd"; $vhdx = Join-Path $newDir "$newName.vhdx"
-    Info "Cloning the .vdi to .vhd (several minutes)..."
-    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    & $vbManage clonemedium disk $vdi.FullName $vhd --format VHD
-    $rc = $LASTEXITCODE; $ErrorActionPreference = $prev
-    if ($rc -ne 0 -or -not (Test-Path $vhd)) { throw "Disk clone failed." }
-    Info "Converting .vhd to .vhdx..."
-    Convert-VHD -Path $vhd -DestinationPath $vhdx -VHDType Dynamic
-    Remove-Item $vhd -Force -ErrorAction SilentlyContinue; Native { & $vbManage closemedium disk $vhd } | Out-Null
-    OK "Disk converted."
-    Step "Creating the Hyper-V VM '$newName'"
-    New-VM -Name $newName -Generation 2 -MemoryStartupBytes ($MemoryMB*1MB) -VHDPath $vhdx -SwitchName $switchName -Path $WorkDir | Out-Null
-    Set-VM -Name $newName -StaticMemory -ErrorAction SilentlyContinue
-    Set-VMProcessor -VMName $newName -Count $Cpus
-    Set-VMFirmware -VMName $newName -EnableSecureBoot On -SecureBootTemplate MicrosoftUEFICertificateAuthority
-    Set-VMFirmware -VMName $newName -FirstBootDevice (Get-VMHardDiskDrive -VMName $newName | Select-Object -First 1)
-    Set-VMHost -EnableEnhancedSessionMode $true -ErrorAction SilentlyContinue
-    OK "VM created. Original VirtualBox VM '$src' left untouched."
-    Step "Snapshot and open"
-    Checkpoint-VM -Name $newName -SnapshotName "clean" -ErrorAction SilentlyContinue
-    Start-VM -Name $newName | Out-Null; try { vmconnect.exe localhost $newName } catch {}
-    Write-Host ""; Write-Host $Rule -ForegroundColor Green; Write-Host "  MIGRATION DONE" -ForegroundColor Green; Write-Host $Rule -ForegroundColor Green
-    OK "'$newName' is running on Hyper-V with a 'clean' checkpoint. Original '$src' is unchanged."
-    Warn "If it fails to boot, tell me. The fix is quick and your original is safe."
-}
-function Show-MigratePlan($src, $vbManage, $WorkDir, $MemoryMB, $Cpus) {
-    # DryRun stand-in for Migrate-VBox: runs the same pre-checks, prints the steps, changes nothing.
-    $newName = "$src-hv"
-    Section "Dry run: moving '$src' to Hyper-V"
-    if (Get-VM -Name $newName -ErrorAction SilentlyContinue) { Warn "A Hyper-V VM '$newName' already exists. The real run would stop here and ask you to delete it first." }
-    $vdi = Get-ChildItem (Join-Path $WorkDir "$src\*.vdi") -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($vdi) {
-        Info ("Source disk: {0} ({1:N1} GB used)" -f $vdi.FullName, ($vdi.Length/1GB))
-        if ($vdi.Length -lt 1GB) { Warn "That disk is almost empty, so Ubuntu was probably never fully installed in '$src'. The moved VM would not boot." }
-    }
-    else { Warn "No .vdi found under $WorkDir\$src. The real run would stop here." }
-    $newDir = Join-Path $WorkDir $newName
-    $hasDefault = $false; try { $hasDefault = [bool](Get-VMSwitch -Name "Default Switch" -ErrorAction Stop) } catch {}
-    $sw = if ($hasDefault) { "the 'Default Switch'" } else { "the 'Default Switch', or a new 'ubuntu-ext-switch' if it's missing" }
-    Would "power off the VirtualBox VM '$src' (if running)"
-    Would "create the folder $newDir"
-    Would "clone the .vdi to $newDir\$newName.vhd, convert it to $newName.vhdx, then delete the .vhd"
-    Would "create the Gen2 Hyper-V VM '$newName' ($MemoryMB MB RAM, $Cpus CPUs, Secure Boot UEFI CA) on $sw"
-    Would "take a 'clean' checkpoint, start '$newName' and open its window"
-    OK "The original VirtualBox VM '$src' would be left untouched."
-}
 # ---- actions (each one returns to the main menu) ------------------------------
 # They read the run-wide facts ($hvEnabled, $vbManage, $hvVMs, $vbVMs, $isos, ...) set by the
 # flow below. Assignments inside a function stay local, so every Create starts from the
@@ -463,7 +408,7 @@ function Invoke-Create {
         Warn "A VM named '$VMName' already exists in $($existing.Where)."
         if ($existing.Where -ne $buildingOn) {
             Warn "You're building on $buildingOn, and both use the folder VMs\$VMName, so replacing will DELETE the $($existing.Where) VM and its disk."
-            if ($existing.Where -eq 'VirtualBox' -and $hvEnabled) { Write-Host "     (To keep it, cancel and rerun, then choose [m] to move it to Hyper-V instead.)" }
+            Write-Host "     (To keep it, pick a different name.)"
         }
         Write-Host "     [r] Replace it (deletes the $($existing.Where) VM '$VMName')"
         Write-Host "     [n] Pick a different name (keeps it)"
@@ -651,22 +596,6 @@ autoinstall:
         Write-Host "   Reset: & `"$VBoxManage`" snapshot $VMName restore clean"
     }
 }
-function Invoke-Migrate {
-    if (-not $hvEnabled) { Info "Moving needs Hyper-V, which isn't enabled on this PC."; return }
-    if (-not $vbVMs) { Info "There are no VirtualBox VMs to move."; return }
-    Write-Host "   VirtualBox VMs you can move:"
-    for ($k = 0; $k -lt $vbVMs.Count; $k++) { Write-Host ("     [{0}] {1}" -f ($k+1), $vbVMs[$k]) }
-    $src = $null
-    do {
-        $pk = (Ask "Enter the number or exact name (Enter to go back)").Trim()
-        if (-not $pk) { return }
-        if ($pk -match '^\d+$' -and [int]$pk -ge 1 -and [int]$pk -le $vbVMs.Count) { $src = $vbVMs[[int]$pk-1] }
-        elseif ($vbVMs -contains $pk) { $src = $pk } else { Warn "Enter a number from the list or the exact name." }
-    } until ($src)
-    Add-Secret "$src-hv" 'vm'
-    if ($DryRun) { Show-MigratePlan $src $vbManage $WorkDir $MemoryMB $Cpus; Write-Host ""; OK "Dry run: nothing was changed."; return }
-    Migrate-VBox $src $vbManage $WorkDir (Ensure-Switch) $MemoryMB $Cpus
-}
 # ---- doctor (read-only) ----------------------------------------------------------
 function Format-Size([double]$bytes) { if ($bytes -gt 0 -and $bytes -lt 1MB) { "< 1 MB" } elseif ($bytes -lt 1GB) { "{0:N0} MB" -f ($bytes/1MB) } else { "{0:N1} GB" -f ($bytes/1GB) } }
 function Get-DiskUsedBytes([string]$dir, [string[]]$files) {
@@ -751,7 +680,7 @@ function Show-VMHealth($h) {
     if ($h.Aborted) { Flag "It crashed or was killed the last time it ran." }
     if (-not $h.Snapshots -and -not $empty -and $h.DiskPath) { Flag "No $($h.SnapWord), so there is nothing to roll back to." }
     if ($h.Where -eq 'VirtualBox' -and $hypervisorOn) {
-        if ($hvEnabled) { Flag "It runs on VirtualBox on top of the Windows hypervisor, which is slow here. [5] can move it to Hyper-V." }
+        if ($hvEnabled) { Flag "It runs on VirtualBox on top of the Windows hypervisor, which is slow here. New VMs built with [1] use Hyper-V instead." }
         else { Flag "It runs on VirtualBox on top of the Windows hypervisor, which is slow here. Enabling Hyper-V would be faster." }
     }
     if (-not $n) { OK "No problems found." }
@@ -914,12 +843,14 @@ function Remove-VMItem($it, [string[]]$keepDirs) {
             } catch { Warn "Couldn't remove the Hyper-V VM '$name' ($($_.Exception.Message)). Its files were left alone."; return }
         }
     } else {
-        if ($DryRun) { Would "power off and unregister the VirtualBox VM '$name', deleting its disks" }
+        # Files outside WorkDir are never deleted: such a VM is only unregistered.
+        $inside = [bool]$it.Dirs
+        if ($DryRun) { Would "power off and unregister the VirtualBox VM '$name'$(if ($inside) { ', deleting its disks' })" }
         else {
             if ($it.Health.Running) { Native { & $vbManage controlvm $name poweroff } | Out-Null; Start-Sleep -Seconds 2 }
-            $rc = Native { & $vbManage unregistervm $name --delete }
-            if ($rc -ne 0) { Warn "VirtualBox couldn't delete '$name' (exit $rc). Its files were left alone."; return }
-            OK "Removed the VirtualBox VM '$name' and its disks."
+            $rc = if ($inside) { Native { & $vbManage unregistervm $name --delete } } else { Native { & $vbManage unregistervm $name } }
+            if ($rc -ne 0) { Warn "VirtualBox couldn't remove '$name' (exit $rc). Its files were left alone."; return }
+            OK "Removed the VirtualBox VM '$name'$(if ($inside) { ' and its disks' })."
         }
     }
     foreach ($d in $it.Dirs) {
@@ -1070,16 +1001,13 @@ try {
         Write-Host "     [2] Rename a VM"
         Write-Host "     [3] Delete VMs, folders or ISOs"
         Write-Host "     [4] Doctor: check the health of your VMs"
-        $canMigrate = $hvEnabled -and $vbVMs
-        if ($canMigrate) { Write-Host "     [5] Move a VirtualBox VM to Hyper-V (keeps the original)" }
         Write-Host "     [q] Quit"
-        $mode = (Ask "Choice (1-$(if ($canMigrate) { 5 } else { 4 }) or q)").Trim().ToLower(); if (-not $mode) { $mode = '1' }
+        $mode = (Ask "Choice (1-4 or q)").Trim().ToLower(); if (-not $mode) { $mode = '1' }
         if ($mode -in 'q', 'quit', 'exit') { break }
         elseif ($mode -eq '1') { Invoke-Create }
         elseif ($mode -eq '2') { Section "Rename a VM"; Invoke-Rename }
         elseif ($mode -eq '3') { Section "Delete VMs, folders or ISOs"; Invoke-Delete }
         elseif ($mode -eq '4') { Section "Doctor: health check"; Invoke-Doctor }
-        elseif ($mode -eq '5' -and $canMigrate) { Section "Move a VirtualBox VM to Hyper-V"; Invoke-Migrate }
         else { Warn "Pick one of the numbers shown, or q to quit." }
     }
     Write-Host ""; OK "Bye."
