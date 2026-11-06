@@ -603,6 +603,8 @@ function Test-HvBuild([string]$name, [string]$vmDir) {
         # checkpoints over once it is detached.
         $why = if ($seed) { "The checkpoints were taken with the seed disk attached." } else { "There are $($other.Count) checkpoint(s) besides 'clean' (Windows adds one automatically each time the VM starts)." }
         Problem $why @("Get-VMSnapshot -VMName $q | Remove-VMSnapshot", "Set-VM -Name $q -AutomaticCheckpointsEnabled `$false", "Stop-VM -Name $q   (shut down inside Ubuntu first if you are logged in)", "Checkpoint-VM -Name $q -SnapshotName clean; Start-VM -Name $q")
+    } elseif ($clean.Count -gt 1) {
+        Problem "It has $($clean.Count) checkpoints named 'clean', so a reset could pick the wrong one. Keep the oldest." @("Get-VMSnapshot -VMName $q -Name clean | Sort-Object CreationTime | Select-Object -Skip 1 | Remove-VMSnapshot")
     } elseif ($clean) { OK "It has a 'clean' checkpoint to reset to." }
     else { Problem "It has no 'clean' checkpoint to reset to." @("Stop-VM -Name $q", "Checkpoint-VM -Name $q -SnapshotName clean; Start-VM -Name $q") }
     if (-not $seed -and -not $other -and $vm.AutomaticCheckpointsEnabled) { Problem "Automatic checkpoints are on, so Windows adds a checkpoint every time the VM starts." @("Set-VM -Name $q -AutomaticCheckpointsEnabled `$false") }
@@ -644,7 +646,8 @@ function Test-VbBuild([string]$name, [string]$vbm) {
     if ($media) { foreach ($m in $media) { Problem "Install media is still attached ($($m.Leaf))." @("$vbq storageattach '$name' --storagectl $($m.Ctl) --port $($m.Port) --device $($m.Dev) --type dvddrive --medium emptydrive") } }
     else { OK "The install ISO is ejected." }
     $snap = @((NativeOut { & $vbm snapshot $name list --machinereadable }) | Where-Object { $_ -match '^SnapshotName(-[\d-]+)?="clean"' })
-    if ($snap) { OK "It has a 'clean' snapshot to reset to." } else { Problem "It has no 'clean' snapshot to reset to." @("$vbq controlvm '$name' acpipowerbutton   (wait until it is off)", "$vbq snapshot '$name' take clean") }
+    if ($snap.Count -gt 1) { Problem "It has $($snap.Count) snapshots named 'clean', so a reset could pick the wrong one. Delete the newer ones in the VirtualBox app (Snapshots)." }
+    elseif ($snap) { OK "It has a 'clean' snapshot to reset to." } else { Problem "It has no 'clean' snapshot to reset to." @("$vbq controlvm '$name' acpipowerbutton   (wait until it is off)", "$vbq snapshot '$name' take clean") }
     $dir = if ($cfg) { Split-Path $cfg -Parent } else { $null }
     $left = @(if ($dir) { Get-ChildItem -LiteralPath $dir -Filter 'Unattended-*' -File -ErrorAction SilentlyContinue })
     if ($left) { Problem "$($left.Count) unattended-install files are still in $dir. They can hold your password in plain text." @("Eject the install media first (above), then: Remove-Item '$dir\Unattended-*'") }
