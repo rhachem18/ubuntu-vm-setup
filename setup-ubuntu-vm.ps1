@@ -202,6 +202,58 @@ function Get-UbuntuIso($UbuntuVersion, $WorkDir) {
     return [pscustomobject]@{ Path = $isoPath; Name = $isoName; Version = $ver }
 }
 
+function Get-Sha512Crypt([string]$password, [string]$salt) {
+    # The standard Linux password hash ("$6$salt$..." = SHA-512 crypt, 5000 rounds, Drepper's
+    # spec), so the install settings never carry the password itself. Checked against
+    # `openssl passwd -6`. PowerShell variables ignore case, hence the distinct names.
+    $itoa = './0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+    if (-not $salt) {
+        $rnd = New-Object byte[] 16; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($rnd)
+        $salt = -join ($rnd | ForEach-Object { $itoa[$_ % 64] })
+    }
+    $sha = [Security.Cryptography.SHA512]::Create()
+    $pw = [Text.Encoding]::UTF8.GetBytes($password); $sl = [Text.Encoding]::ASCII.GetBytes($salt); $plen = $pw.Length
+    $buf = New-Object System.Collections.Generic.List[byte]
+    $buf.AddRange($pw); $buf.AddRange($sl); $buf.AddRange($pw)
+    $hB = $sha.ComputeHash($buf.ToArray())
+    $buf.Clear(); $buf.AddRange($pw); $buf.AddRange($sl)
+    for ($n = $plen; $n -gt 64; $n -= 64) { $buf.AddRange($hB) }
+    if ($n -gt 0) { $buf.AddRange([byte[]]$hB[0..($n - 1)]) }
+    for ($n = $plen; $n -gt 0; $n = $n -shr 1) { if ($n -band 1) { $buf.AddRange($hB) } else { $buf.AddRange($pw) } }
+    $hA = $sha.ComputeHash($buf.ToArray())
+    $buf.Clear(); for ($i = 0; $i -lt $plen; $i++) { $buf.AddRange($pw) }
+    $hDP = $sha.ComputeHash($buf.ToArray())
+    $pSeq = New-Object byte[] $plen; for ($i = 0; $i -lt $plen; $i++) { $pSeq[$i] = $hDP[$i % 64] }
+    $buf.Clear(); for ($i = 0; $i -lt 16 + $hA[0]; $i++) { $buf.AddRange($sl) }
+    $hDS = $sha.ComputeHash($buf.ToArray())
+    $sSeq = New-Object byte[] $sl.Length; for ($i = 0; $i -lt $sl.Length; $i++) { $sSeq[$i] = $hDS[$i % 64] }
+    $cur = $hA
+    for ($i = 0; $i -lt 5000; $i++) {
+        $buf.Clear()
+        if ($i -band 1) { $buf.AddRange($pSeq) } else { $buf.AddRange($cur) }
+        if ($i % 3) { $buf.AddRange($sSeq) }
+        if ($i % 7) { $buf.AddRange($pSeq) }
+        if ($i -band 1) { $buf.AddRange($cur) } else { $buf.AddRange($pSeq) }
+        $cur = $sha.ComputeHash($buf.ToArray())
+    }
+    $out = New-Object Text.StringBuilder
+    $order = @(0,21,42, 22,43,1, 44,2,23, 3,24,45, 25,46,4, 47,5,26, 6,27,48, 28,49,7, 50,8,29, 9,30,51, 31,52,10, 53,11,32, 12,33,54, 34,55,13, 56,14,35, 15,36,57, 37,58,16, 59,17,38, 18,39,60, 40,61,19, 62,20,41)
+    for ($g = 0; $g -lt $order.Count; $g += 3) {
+        $w = ([int]$cur[$order[$g]] -shl 16) -bor ([int]$cur[$order[$g + 1]] -shl 8) -bor [int]$cur[$order[$g + 2]]
+        for ($k = 0; $k -lt 4; $k++) { [void]$out.Append($itoa[$w -band 63]); $w = $w -shr 6 }
+    }
+    $w = [int]$cur[63]; for ($k = 0; $k -lt 2; $k++) { [void]$out.Append($itoa[$w -band 63]); $w = $w -shr 6 }
+    return "`$6`$$salt`$$($out.ToString())"
+}
+function Get-HostResolution {
+    # The monitor's real pixel size, so the VM's screen fills it in full screen.
+    try {
+        $v = Get-CimInstance Win32_VideoController -ErrorAction Stop | Where-Object { $_.CurrentHorizontalResolution -gt 0 } | Select-Object -First 1
+        if ($v) { return @([int]$v.CurrentHorizontalResolution, [int]$v.CurrentVerticalResolution) }
+    } catch {}
+    return @(1920, 1080)
+}
+
 # ---- wizard helpers -------------------------------------------------------
 function Prompt-VMName($default) {
     do {
@@ -362,7 +414,8 @@ function Show-Summary($osText, $target, $saveDir, $mem, $hostRam, $cpu, $hostCpu
     Write-Host ("  Operating system    {0}" -f $osText)
     Write-Host ("  Login username      {0}" -f $user)
     Write-Host ""
-    Write-Host "  This takes about 20 to 40 minutes. You can step away once it starts."
+    Write-Host "  Installing takes about 20 minutes, plus the 6 GB download the first time."
+    if ($hvEnabled) { Write-Host "  You may need to click Install once in the VM window; the script will tell you." }
     Write-Host $Rule -ForegroundColor Green
 }
 function Show-BuildPlan($hvEnabled, $name, $WorkDir, $c, $mem, $cpu, $disk, $ver, $isos) {
@@ -387,8 +440,10 @@ function Show-BuildPlan($hvEnabled, $name, $WorkDir, $c, $mem, $cpu, $disk, $ver
         & $removeOld
         Would "create the folder $vmDir"
         Would "write a cloud-init seed (user-data, meta-data) to $vmDir\seed.vhdx (FAT32, label CIDATA)"
+        $res = Get-HostResolution
         Would "create the Gen2 Hyper-V VM '$name': $mem MB RAM, $cpu CPUs, $disk GB disk at $vmDir\$name.vhdx, Secure Boot UEFI CA"
-        Would "boot the installer, wait up to 90 min for power-off, detach ISO + seed, take a 'clean' checkpoint, start the VM"
+        Would "turn off automatic checkpoints and set its screen to $($res[0])x$($res[1]) (your monitor)"
+        Would "boot the installer (you may click Install once), wait for power-off (90 min from when it starts writing), detach ISO + seed, take a 'clean' checkpoint, start the VM"
     } else {
         Would "install or update VirtualBox via winget if needed"
         Would $isoLine
@@ -451,7 +506,14 @@ function Show-VMWindow([string]$name, [string]$kind) {
     return $false
 }
 function New-InstallProgress([string]$name, [string]$kind) {
-    @{ Name = $name; Kind = $kind; Start = Get-Date; LastBytes = [int64]0; LastGrowth = Get-Date; Phase = $null; LastLog = Get-Date; LastNudge = Get-Date; OnLine = $false }
+    @{ Name = $name; Kind = $kind; Start = Get-Date; FirstWrite = $null; LastBytes = [int64]0; LastGrowth = Get-Date; Phase = $null; LastLog = Get-Date; LastNudge = Get-Date; OnLine = $false }
+}
+function Test-InstallTime($t) {
+    # Keep waiting? The 90 minutes start when the install starts writing, so time spent waiting
+    # for you on the installer's screen doesn't count. 4 hours in all is the hard stop.
+    $now = Get-Date
+    if ($now -ge $t.Start.AddHours(4)) { return $false }
+    return (-not $t.FirstWrite) -or ($now -lt $t.FirstWrite.AddMinutes(90))
 }
 function Update-InstallProgress($t, $cpu, [int64]$bytes) {
     # Rules: almost nothing written 4+ minutes in means the installer is waiting for you (an
@@ -460,6 +522,7 @@ function Update-InstallProgress($t, $cpu, [int64]$bytes) {
     # the reminder every 10 minutes while it lasts.
     $now = Get-Date; $el = $now - $t.Start
     if ($bytes -gt $t.LastBytes + 16MB) { $t.LastBytes = $bytes; $t.LastGrowth = $now }
+    if (-not $t.FirstWrite -and $bytes -ge 512MB) { $t.FirstWrite = $now }
     $idleMin = [int][math]::Floor(($now - $t.LastGrowth).TotalMinutes)
     $low = ($null -eq $cpu) -or ($cpu -lt 10)
     $phase = if ($bytes -lt 512MB) { if ($el.TotalMinutes -ge 4) { 'waiting' } else { 'starting' } }
@@ -525,7 +588,7 @@ function Test-HvBuild([string]$name, [string]$vmDir) {
 
     if (@($vm | Get-VMDvdDrive | Where-Object Path).Count) { Problem "The install ISO is still attached." @("Get-VMDvdDrive -VMName $q | Remove-VMDvdDrive") }
     else { OK "The install ISO is detached." }
-    if ($seed) { Problem "The install seed disk is still attached. It holds your password in plain text." @("Get-VMHardDiskDrive -VMName $q | Where-Object Path -like '*\seed*' | Remove-VMHardDiskDrive") }
+    if ($seed) { Problem "The install seed disk is still attached. It holds your install settings, including the password hash." @("Get-VMHardDiskDrive -VMName $q | Where-Object Path -like '*\seed*' | Remove-VMHardDiskDrive") }
     else { OK "The install seed disk is detached." }
 
     $snaps = @($vm | Get-VMSnapshot -ErrorAction SilentlyContinue)
@@ -541,8 +604,8 @@ function Test-HvBuild([string]$name, [string]$vmDir) {
     if (-not $seed -and -not $other -and $vm.AutomaticCheckpointsEnabled) { Problem "Automatic checkpoints are on, so Windows adds a checkpoint every time the VM starts." @("Set-VM -Name $q -AutomaticCheckpointsEnabled `$false") }
 
     $left = @(Get-ChildItem -LiteralPath $vmDir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'seed*' -or $_.Name -in 'user-data', 'meta-data' })
-    if ($left) { Problem "Install files with your password in plain text are still in $vmDir ($(($left.Name) -join ', '))." @("After the steps above: Remove-Item '$vmDir\seed*', '$vmDir\user-data', '$vmDir\meta-data' -ErrorAction SilentlyContinue") }
-    else { OK "No install files with your password are left in its folder." }
+    if ($left) { Problem "Install files with your settings are still in $vmDir ($(($left.Name) -join ', '))." @("After the steps above: Remove-Item '$vmDir\seed*', '$vmDir\user-data', '$vmDir\meta-data' -ErrorAction SilentlyContinue") }
+    else { OK "No install files are left in its folder." }
 
     $nic = @($vm | Get-VMNetworkAdapter)
     if (-not $nic) { Problem "It has no network adapter." @("Add-VMNetworkAdapter -VMName $q -SwitchName 'Default Switch'") }
@@ -716,6 +779,8 @@ try {
         New-Item -ItemType Directory -Force -Path $vmDir | Out-Null
 
         Step "Preparing the automatic install"
+        # Only the hash goes into the install settings: the installer's review screen shows them.
+        $pwHash = Get-Sha512Crypt $Password
         $userData = @"
 #cloud-config
 autoinstall:
@@ -736,12 +801,7 @@ autoinstall:
         groups: [adm, sudo]
         shell: /bin/bash
         lock_passwd: false
-    chpasswd:
-      expire: false
-      users:
-        - name: $Username
-          password: "$Password"
-          type: text
+        passwd: '$pwHash'
   shutdown: poweroff
 "@
         $udPath = Join-Path $vmDir "user-data"; $mdPath = Join-Path $vmDir "meta-data"
@@ -749,15 +809,24 @@ autoinstall:
         [IO.File]::WriteAllText($mdPath, "instance-id: $VMName`nlocal-hostname: $VMName`n", (New-Object Text.UTF8Encoding($false)))
         $seedVhd = Join-Path $vmDir "seed.vhdx"
         New-VHD -Path $seedVhd -SizeBytes 64MB -Dynamic | Out-Null
-        $mounted = Mount-VHD -Path $seedVhd -Passthru
-        $diskNo = ($mounted | Get-Disk).Number
-        Initialize-Disk -Number $diskNo -PartitionStyle MBR -ErrorAction SilentlyContinue | Out-Null
-        $part = New-Partition -DiskNumber $diskNo -UseMaximumSize -AssignDriveLetter
-        Format-Volume -Partition $part -FileSystem FAT32 -NewFileSystemLabel CIDATA -Confirm:$false | Out-Null
-        $sd = "$($part.DriveLetter):"
-        Copy-Item $udPath "$sd\user-data" -Force; Copy-Item $mdPath "$sd\meta-data" -Force
-        Dismount-VHD -Path $seedVhd
-        # The seed disk now carries these; don't leave the plaintext password in the VM folder.
+        # Formatted before it is reachable, and reached through a temporary folder instead of a
+        # drive letter, so Explorer never sees an empty new drive ("D:\ is not accessible").
+        $mnt = Join-Path $env:TEMP ("cidata-" + [guid]::NewGuid().ToString('N'))
+        $mounted = Mount-VHD -Path $seedVhd -NoDriveLetter -Passthru
+        try {
+            $diskNo = ($mounted | Get-Disk).Number
+            Initialize-Disk -Number $diskNo -PartitionStyle MBR -ErrorAction SilentlyContinue | Out-Null
+            $part = New-Partition -DiskNumber $diskNo -UseMaximumSize
+            Format-Volume -Partition $part -FileSystem FAT32 -NewFileSystemLabel CIDATA -Confirm:$false | Out-Null
+            New-Item -ItemType Directory -Path $mnt | Out-Null
+            Add-PartitionAccessPath -DiskNumber $diskNo -PartitionNumber $part.PartitionNumber -AccessPath "$mnt\"
+            Copy-Item $udPath "$mnt\user-data" -Force; Copy-Item $mdPath "$mnt\meta-data" -Force
+            Remove-PartitionAccessPath -DiskNumber $diskNo -PartitionNumber $part.PartitionNumber -AccessPath "$mnt\" -ErrorAction SilentlyContinue
+        } finally {
+            Dismount-VHD -Path $seedVhd -ErrorAction SilentlyContinue
+            Remove-Item $mnt -Force -ErrorAction SilentlyContinue
+        }
+        # The seed disk now carries these; don't leave copies in the VM folder.
         Remove-Item $udPath, $mdPath -Force -ErrorAction SilentlyContinue
         OK "Install settings prepared."
 
@@ -771,13 +840,19 @@ autoinstall:
         Add-VMHardDiskDrive -VMName $VMName -Path $seedVhd
         Set-VMFirmware -VMName $VMName -FirstBootDevice (Get-VMDvdDrive -VMName $VMName)
         Set-VMHost -EnableEnhancedSessionMode $true -ErrorAction SilentlyContinue
+        # Off: otherwise Windows checkpoints the VM on every start, which also traps the seed disk
+        # inside a checkpoint and asks "revert or continue?" when the VM is started later.
+        Set-VM -Name $VMName -AutomaticCheckpointsEnabled $false -ErrorAction SilentlyContinue
+        $res = Get-HostResolution
+        try { Set-VMVideo -VMName $VMName -HorizontalResolution $res[0] -VerticalResolution $res[1] -ResolutionType Single -ErrorAction Stop; Info "Screen size: $($res[0])x$($res[1]) (your monitor)." }
+        catch { Warn "Couldn't set the screen size to $($res[0])x$($res[1]); it stays at Hyper-V's default (1024x768)." }
         OK "VM created."
 
         Step "Installing Ubuntu"
         Start-VM -Name $VMName | Out-Null; try { vmconnect.exe localhost $VMName } catch {}
         Warn "The installer may stop once on a 'Ready to install' screen: click Install there, then leave it."
         Info "Installing. The VM powers off by itself when done..."
-        $prog = New-InstallProgress $VMName 'hv'; $deadline = $prog.Start.AddMinutes(90); $done = $false
+        $prog = New-InstallProgress $VMName 'hv'; $done = $false
         do {
             Start-Sleep -Seconds 15
             $vmNow = Get-VM -Name $VMName
@@ -785,19 +860,33 @@ autoinstall:
             # The system disk's current file (an .avhdx once a checkpoint exists), not the seed.
             $osNow = $vmNow | Get-VMHardDiskDrive | Where-Object { $_.Path -notlike '*\seed*' } | Select-Object -First 1
             Update-InstallProgress $prog ([int]$vmNow.CPUUsage) $(if ($osNow) { Get-VhdChainBytes $osNow.Path } else { 0 })
-        } while ((Get-Date) -lt $deadline)
+        } while (Test-InstallTime $prog)
         Microsoft.PowerShell.Utility\Write-Host ""
-        if (-not $done) { throw "Install did not finish within 90 minutes. Open the VM window to check; finish it, power off, then run: Checkpoint-VM -VMName $VMName -SnapshotName clean" }
+        if (-not $done) {
+            $q = "'$VMName'"
+            Warn "The install didn't finish in time (90 minutes after it started writing). The VM is left as it is."
+            Write-Host "     When the install has finished and the VM is off, run these in an Administrator PowerShell:"
+            foreach ($c in @("Get-VMDvdDrive -VMName $q | Remove-VMDvdDrive",
+                             "Get-VMHardDiskDrive -VMName $q | Where-Object Path -like '*\seed*' | Remove-VMHardDiskDrive",
+                             "Set-VMFirmware -VMName $q -FirstBootDevice (Get-VMHardDiskDrive -VMName $q | Select-Object -First 1)",
+                             "Remove-Item '$seedVhd'",
+                             "Checkpoint-VM -Name $q -SnapshotName clean",
+                             "Start-VM -Name $q")) { Write-Host "       $c" }
+            throw "Install did not finish in time."
+        }
         OK ("Ubuntu installed in {0:hh\:mm\:ss}; the VM powered itself off." -f ((Get-Date) - $prog.Start))
         Info "Ejecting the install ISO and the seed disk..."
         Get-VMDvdDrive -VMName $VMName | Remove-VMDvdDrive
-        Get-VMHardDiskDrive -VMName $VMName | Where-Object Path -eq $seedVhd | Remove-VMHardDiskDrive
+        # By pattern, not exact path: a checkpoint would point the drive at seed_<id>.avhdx.
+        Get-VMHardDiskDrive -VMName $VMName | Where-Object { $_.Path -like '*\seed*' } | Remove-VMHardDiskDrive
         Set-VMFirmware -VMName $VMName -FirstBootDevice (Get-VMHardDiskDrive -VMName $VMName | Select-Object -First 1)
         Remove-Item $seedVhd -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $seedVhd) { Warn "Couldn't delete $seedVhd; the health check below says how." }
         Info "Taking the 'clean' checkpoint..."
         Checkpoint-VM -Name $VMName -SnapshotName "clean"
-        Info "Starting the VM and opening its window..."
-        Start-VM -Name $VMName | Out-Null; try { vmconnect.exe localhost $VMName } catch {}
+        Info "Starting the VM and bringing its window up..."
+        # Raise the window that is already open; a second one would ask "another user is connected".
+        Start-VM -Name $VMName | Out-Null; [void](Show-VMWindow $VMName 'hv')
 
         Show-Done (Test-HvBuild $VMName $vmDir)
         OK "'$VMName' (Ubuntu $UbuntuVersion) is on Hyper-V."
@@ -843,16 +932,16 @@ autoinstall:
         Step "Installing Ubuntu (automatic)"
         VBox unattended install $VMName --iso=$isoPath --user=$Username --password=$Password --full-user-name=$Username --hostname="$VMName.local" --locale=en_US --time-zone=$TimeZone --install-additions --start-vm=gui
         Info "Installing. This runs on its own..."
-        $prog = New-InstallProgress $VMName 'vb'; $deadline = $prog.Start.AddMinutes(90); $installed = $false
+        $prog = New-InstallProgress $VMName 'vb'; $installed = $false
         do {
             Start-Sleep -Seconds 15
             $ga = NativeOut { & $VBoxManage guestproperty get $VMName "/VirtualBox/GuestAdd/Version" }
             if ($ga -match '^Value:') { $installed = $true; break }
             $bytes = [int64]0; foreach ($l in (NativeOut { & $VBoxManage showmediuminfo disk $vdiPath })) { if ($l -match '^Size on disk:\s*(\d+)\s*MBytes') { $bytes = [int64]$Matches[1] * 1MB } }
             Update-InstallProgress $prog $null $bytes
-        } while ((Get-Date) -lt $deadline)
+        } while (Test-InstallTime $prog)
         Microsoft.PowerShell.Utility\Write-Host ""
-        if (-not $installed) { throw "Install did not complete within 90 minutes. Check the VM window." }
+        if (-not $installed) { throw "Install did not finish in time (90 minutes after it started writing). Check the VM window." }
         OK ("Ubuntu installed in {0:hh\:mm\:ss}." -f ((Get-Date) - $prog.Start))
 
         Step "Saving a clean snapshot"

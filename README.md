@@ -14,7 +14,10 @@ accept or customize, and a clear summary before it builds anything.
   - **VirtualBox** when there is no hypervisor (for example, Windows Home). Installs or
     updates VirtualBox for you if needed.
 - Finds and downloads the **latest Ubuntu LTS Desktop** ISO, and verifies its SHA256 checksum.
-- Installs Ubuntu **unattended** (on Hyper-V you confirm the automated install once).
+- Installs Ubuntu **unattended**. On Hyper-V the installer stops once on a "Ready to install"
+  screen: click **Install**. If it waits, the script tells you and brings the VM window up.
+  The password is stored only as a hash (`$6$...`), never as plain text.
+- Sets the VM's screen to your monitor's resolution, so full screen fills it.
 - Asks where to save the VM (recommended: `%USERPROFILE%\VMs`, with its free space shown).
   It must be a folder on a local drive.
 - Creates the VM with your chosen memory, CPUs, and disk, and a login account you set.
@@ -65,8 +68,8 @@ what replacing would delete, and you choose:
    .\setup-ubuntu-vm.ps1
    ```
 
-The whole thing takes about 20 to 40 minutes, most of it the download and install. You can
-step away once it starts.
+Installing takes about 20 minutes, plus the 6 GB download the first time. While it runs the
+script shows how much has been written, and warns you if the installer is waiting for you.
 
 ## Options
 
