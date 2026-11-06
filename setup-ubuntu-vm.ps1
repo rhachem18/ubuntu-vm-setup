@@ -293,7 +293,7 @@ function Show-SettingsTable($label, $mem, $cpu, $disk, $hostRam, $hostCpu) {
 }
 function Read-IntOr($prompt, $default, $min, $max) {
     while ($true) {
-        $in = (Ask ("$prompt [$default]")).Trim()
+        $in = (Ask ("$prompt (press Enter to use $default)")).Trim()
         if (-not $in) { return $default }
         if ($in -match '^\d+$') {
             $v = [int]$in
@@ -320,10 +320,10 @@ function Choose-Settings($hostRam, $hostCpu, $defMem, $defCpu, $defDisk, $defVer
     if ($pick -eq 'c') {
         $maxMem = [math]::Max(2048, $hostRam - 2048)
         $maxCpu = [math]::Max(1, $hostCpu - 1)
-        $mem = Read-IntOr "Memory in MB (1024 = 1 GB)" $recMem 2048 $maxMem
+        $mem = Read-IntOr "Memory in MB, 1024 = 1 GB" $recMem 2048 $maxMem
         $cpu = Read-IntOr "Number of CPUs" $recCpu 1 $maxCpu
         $disk = Read-IntOr "Disk size in GB" $defDisk 25 4096
-        $verIn = (Ask "Ubuntu version: lts / latest / a number like 24.04 [$defVer]").Trim()
+        $verIn = (Ask "Ubuntu version: lts, latest or a number like 24.04 (press Enter to use $defVer)").Trim()
         if (-not $verIn) { $verIn = $defVer }
         return [pscustomobject]@{ Mem = $mem; Cpu = $cpu; Disk = $disk; Ver = $verIn }
     }
