@@ -426,6 +426,108 @@ function Ensure-Switch {
     if (-not (Get-VMSwitch -Name $sw -ErrorAction SilentlyContinue)) { New-VMSwitch -Name $sw -NetAdapterName $nic.Name -AllowManagementOS $true | Out-Null }
     return $sw
 }
+# ---- health check of the VM just built (read-only: it reports and suggests, never changes) ----
+function Problem([string]$msg, [string[]]$fix) {
+    $script:HealthProblems++
+    Warn $msg
+    if ($fix) { Write-Host "       Fix:  $($fix[0])"; foreach ($f in ($fix | Select-Object -Skip 1)) { Write-Host "             $f" } }
+}
+function Get-VhdChainBytes([string]$path) {
+    # A disk with checkpoints is a chain of .avhdx files on top of the .vhdx: add them all up.
+    # Get-VHD reads the real size; a directory listing can lag behind for a file in use.
+    $sum = 0; $n = 0
+    while ($path -and $n -lt 32) { try { $v = Get-VHD -Path $path -ErrorAction Stop } catch { break }; $sum += $v.FileSize; $path = $v.ParentPath; $n++ }
+    return $sum
+}
+function Test-HvBuild([string]$name, [string]$vmDir) {
+    $script:HealthProblems = 0
+    Section "Health check"
+    try { $vm = Get-VM -Name $name -ErrorAction Stop } catch { Problem "Can't read the Hyper-V VM '$name' ($($_.Exception.Message))."; return $script:HealthProblems }
+    $q = "'$name'"
+    if ("$($vm.State)" -eq 'Running') { OK "It is running." }
+    else { Problem "It isn't running (state: $($vm.State))." @("Start-VM -Name $q") }
+
+    $disks = @($vm | Get-VMHardDiskDrive)
+    $seed = @($disks | Where-Object { $_.Path -like '*\seed.vhdx' -or $_.Path -like '*\seed_*.avhdx' })
+    $os = $disks | Where-Object { $seed -notcontains $_ } | Select-Object -First 1
+    if ($os) {
+        $used = Get-VhdChainBytes $os.Path
+        if ($used -ge 3GB) { OK ("Ubuntu is on its disk ({0} used)." -f (Format-Size $used)) }
+        else { Problem ("Its disk is almost empty ({0} used), so Ubuntu may not have installed." -f (Format-Size $used)) @("Open the VM window and look. If the installer is showing, finish it; otherwise build it again.") }
+    } else { Problem "It has no system disk attached." }
+
+    if (@($vm | Get-VMDvdDrive | Where-Object Path).Count) { Problem "The install ISO is still attached." @("Get-VMDvdDrive -VMName $q | Remove-VMDvdDrive") }
+    else { OK "The install ISO is detached." }
+    if ($seed) { Problem "The install seed disk is still attached. It holds your password in plain text." @("Get-VMHardDiskDrive -VMName $q | Where-Object Path -like '*\seed*' | Remove-VMHardDiskDrive") }
+    else { OK "The install seed disk is detached." }
+
+    $snaps = @($vm | Get-VMSnapshot -ErrorAction SilentlyContinue)
+    $clean = @($snaps | Where-Object Name -eq 'clean')
+    $other = @($snaps | Where-Object Name -ne 'clean')
+    if ($seed -or $other) {
+        # The seed disk lives on inside any checkpoint taken while it was attached, so start the
+        # checkpoints over once it is detached.
+        $why = if ($seed) { "The checkpoints were taken with the seed disk attached." } else { "There are $($other.Count) checkpoint(s) besides 'clean' (Windows adds one automatically each time the VM starts)." }
+        Problem $why @("Get-VMSnapshot -VMName $q | Remove-VMSnapshot", "Set-VM -Name $q -AutomaticCheckpointsEnabled `$false", "Stop-VM -Name $q   (shut down inside Ubuntu first if you are logged in)", "Checkpoint-VM -Name $q -SnapshotName clean; Start-VM -Name $q")
+    } elseif ($clean) { OK "It has a 'clean' checkpoint to reset to." }
+    else { Problem "It has no 'clean' checkpoint to reset to." @("Stop-VM -Name $q", "Checkpoint-VM -Name $q -SnapshotName clean; Start-VM -Name $q") }
+    if (-not $seed -and -not $other -and $vm.AutomaticCheckpointsEnabled) { Problem "Automatic checkpoints are on, so Windows adds a checkpoint every time the VM starts." @("Set-VM -Name $q -AutomaticCheckpointsEnabled `$false") }
+
+    $left = @(Get-ChildItem -LiteralPath $vmDir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'seed*' -or $_.Name -in 'user-data', 'meta-data' })
+    if ($left) { Problem "Install files with your password in plain text are still in $vmDir ($(($left.Name) -join ', '))." @("After the steps above: Remove-Item '$vmDir\seed*', '$vmDir\user-data', '$vmDir\meta-data' -ErrorAction SilentlyContinue") }
+    else { OK "No install files with your password are left in its folder." }
+
+    $nic = @($vm | Get-VMNetworkAdapter)
+    if (-not $nic) { Problem "It has no network adapter." @("Add-VMNetworkAdapter -VMName $q -SwitchName 'Default Switch'") }
+    elseif (-not ($nic | Where-Object SwitchName)) { Problem "Its network adapter isn't connected to a switch, so it has no internet." @("Connect-VMNetworkAdapter -VMName $q -SwitchName 'Default Switch'") }
+    else { OK "Its network is connected (switch '$(($nic | Where-Object SwitchName | Select-Object -First 1).SwitchName)')." }
+    return $script:HealthProblems
+}
+function Test-VbBuild([string]$name, [string]$vbm) {
+    $script:HealthProblems = 0
+    Section "Health check"
+    $info = NativeOut { & $vbm showvminfo $name --machinereadable }
+    if ($LASTEXITCODE -ne 0 -or -not $info) { Problem "Can't read the VirtualBox VM '$name'."; return $script:HealthProblems }
+    $state = ''; $cfg = $null; $disk = $null; $media = @(); $nic = $null
+    foreach ($l in $info) {
+        if ($l -match '^VMState="([^"]+)"') { $state = $Matches[1] }
+        elseif ($l -match '^CfgFile="(.+)"$') { $cfg = $Matches[1] -replace '\\\\', '\' }
+        elseif ($l -match '^nic1="([^"]+)"') { $nic = $Matches[1] }
+        elseif ($l -match '^"([^"]+)-(\d+)-(\d+)"="(.+)"$') {
+            $ctl = $Matches[1]; $port = $Matches[2]; $dev = $Matches[3]; $pth = $Matches[4] -replace '\\\\', '\'
+            if ($pth -match '\.(vdi|vhdx?|vmdk)$' -and -not $disk) { $disk = $pth }
+            elseif ($pth -match '\.(iso|viso)$') { $media += [pscustomobject]@{ Ctl = $ctl; Port = $port; Dev = $dev; Leaf = Split-Path $pth -Leaf } }
+        }
+    }
+    $vbq = "& `"$vbm`""
+    if ($state -eq 'running') { OK "It is running." } else { Problem "It isn't running (state: $state)." @("$vbq startvm '$name' --type gui") }
+    if ($disk) {
+        $used = $null; foreach ($l in (NativeOut { & $vbm showmediuminfo disk $disk })) { if ($l -match '^Size on disk:\s*(\d+)\s*MBytes') { $used = [int64]$Matches[1] * 1MB } }
+        if ($null -eq $used) { Info "Couldn't read how much of its disk is used." }
+        elseif ($used -ge 3GB) { OK ("Ubuntu is on its disk ({0} used)." -f (Format-Size $used)) }
+        else { Problem ("Its disk is almost empty ({0} used), so Ubuntu may not have installed." -f (Format-Size $used)) @("Open the VM window and look. If the installer is showing, finish it; otherwise build it again.") }
+    } else { Problem "It has no disk attached." }
+    if ($media) { foreach ($m in $media) { Problem "Install media is still attached ($($m.Leaf))." @("$vbq storageattach '$name' --storagectl $($m.Ctl) --port $($m.Port) --device $($m.Dev) --type dvddrive --medium emptydrive") } }
+    else { OK "The install ISO is ejected." }
+    $snap = @((NativeOut { & $vbm snapshot $name list --machinereadable }) | Where-Object { $_ -match '^SnapshotName(-[\d-]+)?="clean"' })
+    if ($snap) { OK "It has a 'clean' snapshot to reset to." } else { Problem "It has no 'clean' snapshot to reset to." @("$vbq controlvm '$name' acpipowerbutton   (wait until it is off)", "$vbq snapshot '$name' take clean") }
+    $dir = if ($cfg) { Split-Path $cfg -Parent } else { $null }
+    $left = @(if ($dir) { Get-ChildItem -LiteralPath $dir -Filter 'Unattended-*' -File -ErrorAction SilentlyContinue })
+    if ($left) { Problem "$($left.Count) unattended-install files are still in $dir. They can hold your password in plain text." @("Eject the install media first (above), then: Remove-Item '$dir\Unattended-*'") }
+    else { OK "No unattended-install files are left in its folder." }
+    if ($nic -and $nic -ne 'none') { OK "Its network is on ($nic)." } else { Problem "It has no network adapter." @("$vbq modifyvm '$name' --nic1 nat   (with the VM off)") }
+    return $script:HealthProblems
+}
+function Show-Done([int]$problems, [string]$what) {
+    Write-Host ""
+    $color = if ($problems) { 'Yellow' } else { 'Green' }
+    Write-Host $Rule -ForegroundColor $color
+    if ($problems) { Write-Host "  BUILT, BUT $problems THING(S) NEED FIXING (see the health check above)" -ForegroundColor $color }
+    else { Write-Host "  ALL DONE" -ForegroundColor $color }
+    Write-Host $Rule -ForegroundColor $color
+    if ($problems) { Warn "Run each 'Fix' line above in an Administrator PowerShell, in order." }
+}
+
 # ======================================================================= START
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin -and -not $DryRun) { throw "Please run PowerShell as Administrator, then run this again. (Or add -DryRun to rehearse without changing anything.)" }
@@ -619,8 +721,8 @@ autoinstall:
         Checkpoint-VM -Name $VMName -SnapshotName "clean"
         Start-VM -Name $VMName | Out-Null; try { vmconnect.exe localhost $VMName } catch {}
 
-        Write-Host ""; Write-Host $Rule -ForegroundColor Green; Write-Host "  ALL DONE" -ForegroundColor Green; Write-Host $Rule -ForegroundColor Green
-        OK "'$VMName' (Ubuntu $UbuntuVersion) is running on Hyper-V with a 'clean' checkpoint."
+        Show-Done (Test-HvBuild $VMName $vmDir)
+        OK "'$VMName' (Ubuntu $UbuntuVersion) is on Hyper-V."
         OK "Log in with username '$Username' and your password."
         Write-Host "   Open later:  Hyper-V Manager, double-click '$VMName'"
         Write-Host "   Reset:       Restore-VMCheckpoint -VMName $VMName -Name clean -Confirm:`$false"
@@ -677,8 +779,8 @@ autoinstall:
         VBox snapshot $VMName take clean --description "Clean Ubuntu install"
         VBox startvm $VMName --type gui
 
-        Write-Host ""; Write-Host $Rule -ForegroundColor Green; Write-Host "  ALL DONE" -ForegroundColor Green; Write-Host $Rule -ForegroundColor Green
-        OK "'$VMName' (Ubuntu $UbuntuVersion) is running on VirtualBox with a 'clean' snapshot."
+        Show-Done (Test-VbBuild $VMName $VBoxManage)
+        OK "'$VMName' (Ubuntu $UbuntuVersion) is on VirtualBox."
         OK "Log in with username '$Username' and your password."
         Write-Host "   Reset: & `"$VBoxManage`" snapshot $VMName restore clean"
     }
