@@ -19,6 +19,8 @@
      Unblock-File .\setup-ubuntu-vm.ps1
      .\setup-ubuntu-vm.ps1
   Override any default up front:  .\setup-ubuntu-vm.ps1 -VMName ubuntu-test -MemoryMB 8192
+  Rehearse without changing anything:  .\setup-ubuntu-vm.ps1 -DryRun
+     (works without admin, but Hyper-V VMs are only visible to an elevated session)
   If Hyper-V is off but the hypervisor is on (VBS), enable it for speed:
      dism /online /enable-feature /featurename:Microsoft-Hyper-V-All /all /norestart   (then reboot)
 #>
@@ -31,7 +33,9 @@ param(
     [int]$Cpus             = 4,
     [int]$DiskGB           = 50,
     [string]$TimeZone      = "Europe/Lisbon",
-    [string]$WorkDir       = "$env:USERPROFILE\VMs"
+    [string]$WorkDir       = "$env:USERPROFILE\VMs",
+    # Walk the whole wizard but change nothing: no create, delete, convert or download.
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
@@ -50,6 +54,11 @@ function Warn($msg) { Write-Host "   ! $msg" -ForegroundColor Yellow }
 function OK($msg)   { Write-Host "   $([char]0x2713) $msg" -ForegroundColor Green }
 function Get-Text($resp) { if ($resp.Content -is [byte[]]) { return [System.Text.Encoding]::UTF8.GetString($resp.Content) }; return [string]$resp.Content }
 function Native([scriptblock]$Cmd) { $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; try { & $Cmd 2>$null | Out-Null } finally { $ErrorActionPreference = $prev }; return $LASTEXITCODE }
+# Like Native, but returns stdout lines. In Windows PowerShell 5.1 even `2>$null` on a native
+# command throws under EAP=Stop when it writes to stderr, so read-only queries go through here.
+# Check $LASTEXITCODE after calling.
+function NativeOut([scriptblock]$Cmd) { $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; try { $o = @(& $Cmd 2>$null) } finally { $ErrorActionPreference = $prev }; return $o }
+function Would($msg) { Write-Host "   [dry run] would $msg" -ForegroundColor Magenta }
 function Get-VBoxManage { foreach ($c in @("$env:VBOX_MSI_INSTALL_PATH\VBoxManage.exe", "$env:ProgramFiles\Oracle\VirtualBox\VBoxManage.exe")) { if ($c -and (Test-Path $c)) { return $c } }; return $null }
 
 function Resolve-UbuntuVersion($req) {
@@ -160,7 +169,7 @@ function Get-ExistingVMSettings($name, $hvEnabled, $vbManage) {
         return [pscustomobject]@{ Found = $true; Where = 'Hyper-V'; Mem = $mem; Cpu = $cpu; Disk = $disk }
     }
     if ($vbManage) {
-        $info = & $vbManage showvminfo $name --machinereadable 2>$null
+        $info = NativeOut { & $vbManage showvminfo $name --machinereadable }
         if ($LASTEXITCODE -eq 0 -and $info) {
             $mem = 0; $cpu = 0
             foreach ($l in $info) { if ($l -match '^memory=(\d+)') { $mem = [int]$Matches[1] }; if ($l -match '^cpus=(\d+)') { $cpu = [int]$Matches[1] } }
@@ -220,7 +229,7 @@ function Choose-Settings($hostRam, $hostCpu, $defMem, $defCpu, $defDisk, $defVer
     }
     return [pscustomobject]@{ Mem = $recMem; Cpu = $recCpu; Disk = $defDisk; Ver = $defVer }
 }
-function Show-Summary($osText, $target, $mem, $hostRam, $cpu, $hostCpu, $disk, $user, $name, $replaces, $replacesWhere) {
+function Show-Summary($osText, $target, $mem, $hostRam, $cpu, $hostCpu, $disk, $user, $name, $replaces, $replacesWhere, $leftoverDir) {
     Write-Host ""
     Write-Host $Rule -ForegroundColor Green
     Write-Host "  READY TO BUILD" -ForegroundColor Green
@@ -233,9 +242,39 @@ function Show-Summary($osText, $target, $mem, $hostRam, $cpu, $hostCpu, $disk, $
     Write-Host ("  Login username      {0}" -f $user)
     Write-Host ("  VM name             {0}" -f $name)
     if ($replaces) { Write-Host ("  Note                DELETES the existing {0} VM '{1}' and its disk" -f $replacesWhere, $name) -ForegroundColor Yellow }
+    elseif ($leftoverDir) { Write-Host ("  Note                DELETES the leftover folder {0} (no VM uses it)" -f $leftoverDir) -ForegroundColor Yellow }
     Write-Host ""
     Write-Host "  This takes about 20 to 40 minutes. You can step away once it starts."
     Write-Host $Rule -ForegroundColor Green
+}
+function Show-BuildPlan($hvEnabled, $name, $WorkDir, $replaces, $replacesWhere, $leftoverDir, $mem, $cpu, $disk, $ver, $isos) {
+    # DryRun stand-in for the build: mirrors the real build order, changes nothing.
+    Write-Host ""
+    Write-Host "   DRY RUN: the build would do the following" -ForegroundColor Magenta
+    $vmDir = Join-Path $WorkDir $name
+    if ($replaces) {
+        if ($replacesWhere -eq 'VirtualBox') { Would "power off and unregister the VirtualBox VM '$name', deleting its disks" }
+        else { Would "turn off and remove the Hyper-V VM '$name'" }
+        if (Test-Path $vmDir) { Would "delete the folder $vmDir" }
+    } elseif ($leftoverDir) { Would "delete the leftover folder $leftoverDir" }
+    # Resolving the version is a read-only metadata lookup, and exercises the same parsing as a real run.
+    $ver = Resolve-UbuntuVersion $ver
+    $isoLine = if ($isos | Where-Object Name -like "ubuntu-$ver-desktop-*") { "reuse the saved Ubuntu $ver Desktop ISO if its SHA256 still matches (else re-download ~6 GB)" } else { "download the Ubuntu $ver Desktop ISO (~6 GB) into $WorkDir and verify its SHA256" }
+    if ($hvEnabled) {
+        Would "create the folder $vmDir"
+        $hasDefault = $false; try { $hasDefault = [bool](Get-VMSwitch -Name "Default Switch" -ErrorAction Stop) } catch {}
+        $sw = if ($hasDefault) { "use the 'Default Switch'" } else { "use the 'Default Switch', or create 'ubuntu-ext-switch' if it's missing" }
+        Would $sw
+        Would $isoLine
+        Would "write a cloud-init seed (user-data, meta-data) to $vmDir\seed.vhdx (FAT32, label CIDATA)"
+        Would "create the Gen2 Hyper-V VM '$name': $mem MB RAM, $cpu CPUs, $disk GB disk at $vmDir\$name.vhdx, Secure Boot UEFI CA"
+        Would "boot the installer, wait up to 90 min for power-off, detach ISO + seed, take a 'clean' checkpoint, start the VM"
+    } else {
+        Would "install or update VirtualBox via winget if needed"
+        Would $isoLine
+        Would "register the VirtualBox VM '$name': $mem MB RAM, $cpu CPUs, EFI, NAT, $disk GB disk at $vmDir\$name.vdi"
+        Would "run the unattended install, wait up to 90 min, eject the ISO, take a 'clean' snapshot, start the VM"
+    }
 }
 function Remove-NamedVM($name, $WorkDir, $vbManage) {
     # Remove a VM of this name wherever it lives (Hyper-V and/or VirtualBox), then its folder.
@@ -249,8 +288,8 @@ function Remove-NamedVM($name, $WorkDir, $vbManage) {
         }
     }
     if ($vbManage) {
-        $vms = & $vbManage list vms 2>$null
-        if ($vms -match "`"$name`"") {
+        $vms = NativeOut { & $vbManage list vms }
+        if ($vms -match ('"' + [regex]::Escape($name) + '"')) {
             Native { & $vbManage controlvm $name poweroff } | Out-Null
             Start-Sleep -Seconds 2
             Native { & $vbManage unregistervm $name --delete } | Out-Null
@@ -303,17 +342,65 @@ function Migrate-VBox($src, $vbManage, $WorkDir, $switchName, $MemoryMB, $Cpus) 
     OK "'$newName' is running on Hyper-V with a 'clean' checkpoint. Original '$src' is unchanged."
     Warn "If it fails to boot, tell me. The fix is quick and your original is safe."
 }
-function Remove-OldItems($WorkDir, $vbManage, $hvVMs, $vbVMs, $isos) {
+function Show-MigratePlan($src, $vbManage, $WorkDir, $MemoryMB, $Cpus) {
+    # DryRun stand-in for Migrate-VBox: runs the same pre-checks, prints the steps, changes nothing.
+    $newName = "$src-hv"
+    Section "Dry run: moving '$src' to Hyper-V"
+    if (Get-VM -Name $newName -ErrorAction SilentlyContinue) { Warn "A Hyper-V VM '$newName' already exists. The real run would stop here and ask you to delete it first." }
+    $vdi = Get-ChildItem (Join-Path $WorkDir "$src\*.vdi") -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($vdi) {
+        Info ("Source disk: {0} ({1:N1} GB used)" -f $vdi.FullName, ($vdi.Length/1GB))
+        if ($vdi.Length -lt 1GB) { Warn "That disk is almost empty, so Ubuntu was probably never fully installed in '$src'. The moved VM would not boot." }
+    }
+    else { Warn "No .vdi found under $WorkDir\$src. The real run would stop here." }
+    $newDir = Join-Path $WorkDir $newName
+    $hasDefault = $false; try { $hasDefault = [bool](Get-VMSwitch -Name "Default Switch" -ErrorAction Stop) } catch {}
+    $sw = if ($hasDefault) { "the 'Default Switch'" } else { "the 'Default Switch', or a new 'ubuntu-ext-switch' if it's missing" }
+    Would "power off the VirtualBox VM '$src' (if running)"
+    Would "create the folder $newDir"
+    Would "clone the .vdi to $newDir\$newName.vhd, convert it to $newName.vhdx, then delete the .vhd"
+    Would "create the Gen2 Hyper-V VM '$newName' ($MemoryMB MB RAM, $Cpus CPUs, Secure Boot UEFI CA) on $sw"
+    Would "take a 'clean' checkpoint, start '$newName' and open its window"
+    OK "The original VirtualBox VM '$src' would be left untouched."
+}
+function Remove-OldItems($WorkDir, $vbManage, $hvVMs, $vbVMs, $isos, [bool]$DryRun) {
     Write-Host "   What to delete?"
     Write-Host "     [i] ISO files only (frees space, forces re-download next time)"
     Write-Host "     [v] A specific VM by name"
     Write-Host "     [a] EVERYTHING under $WorkDir (all VMs + ISOs, keeps logs)"
     Write-Host "     [n] Nothing, continue"
     $d = (Read-Host "Choice (i/v/a/n)").Trim().ToLower()
+    $name = $null
+    if ($d -eq 'v') {
+        $name = (Read-Host "VM name to delete").Trim()
+        # An empty name would make Join-Path point at $WorkDir itself and wipe every VM folder.
+        if (-not $name -or $name -notmatch '^[A-Za-z0-9._-]+$' -or $name -match '^\.+$') { Info "No valid VM name given. Nothing deleted."; return }
+    }
+    if ($DryRun) {
+        switch ($d) {
+            'i' { if ($isos) { foreach ($i in $isos) { Would ("delete {0} ({1:N0} MB)" -f $i.Name, ($i.Length/1MB)) } } else { Info "No ISOs to delete." } }
+            'v' {
+                $any = $false
+                if ($hvVMs -contains $name) { Would "turn off and remove the Hyper-V VM '$name'"; $any = $true }
+                if ($vbManage -and ($vbVMs -contains $name)) { Would "power off and unregister the VirtualBox VM '$name', deleting its disks"; $any = $true }
+                $dir = Join-Path $WorkDir $name; if (Test-Path $dir) { Would "delete the folder $dir"; $any = $true }
+                if (-not $any) { Info "No VM or folder named '$name' found. Nothing would be deleted." }
+            }
+            'a' {
+                Warn "This permanently deletes ALL VMs and ISOs under $WorkDir."
+                if ((Read-Host "Type 'yes' to confirm") -ne 'yes') { Info "Skipped."; return }
+                foreach ($n in $hvVMs) { Would "turn off and remove the Hyper-V VM '$n'" }
+                foreach ($n in $vbVMs) { Would "power off and unregister the VirtualBox VM '$n', deleting its disks" }
+                foreach ($f in @(Get-ChildItem $WorkDir -Exclude "setup-log-*.txt" -ErrorAction SilentlyContinue)) { Would "delete $($f.FullName)" }
+                Info "Logs (setup-log-*.txt) would be kept."
+            }
+            default { Info "Nothing deleted." }
+        }
+        return
+    }
     switch ($d) {
         'i' { foreach ($i in $isos) { Remove-Item $i.FullName -Force -ErrorAction SilentlyContinue; Info "Deleted $($i.Name)" } }
         'v' {
-            $name = (Read-Host "VM name to delete").Trim()
             if ($hvVMs -contains $name) { Stop-VM $name -TurnOff -Force -ErrorAction SilentlyContinue; Remove-VM $name -Force -ErrorAction SilentlyContinue; Info "Removed Hyper-V VM $name" }
             if ($vbManage -and ($vbVMs -contains $name)) { Native { & $vbManage controlvm $name poweroff } | Out-Null; Native { & $vbManage unregistervm $name --delete } | Out-Null; Info "Removed VirtualBox VM $name" }
             $dir = Join-Path $WorkDir $name; if (Test-Path $dir) { Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue; Info "Removed folder $name" }
@@ -332,14 +419,18 @@ function Remove-OldItems($WorkDir, $vbManage, $hvVMs, $vbVMs, $isos) {
 
 # ======================================================================= START
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) { throw "Please run PowerShell as Administrator, then run this again." }
+if (-not $isAdmin -and -not $DryRun) { throw "Please run PowerShell as Administrator, then run this again. (Or add -DryRun to rehearse without changing anything.)" }
 
-New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
-$logPath = Join-Path $WorkDir ("setup-log-{0:yyyyMMdd-HHmmss}.txt" -f (Get-Date))
-try { Start-Transcript -Path $logPath -Append | Out-Null; $transcriptOn = $true } catch { $transcriptOn = $false }
+# A dry run only writes its log, and only into a WorkDir that already exists.
+$transcriptOn = $false
+if (-not $DryRun) { New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null }
+if (Test-Path $WorkDir) {
+    $logPath = Join-Path $WorkDir ("setup-log-{0:yyyyMMdd-HHmmss}{1}.txt" -f (Get-Date), $(if ($DryRun) { '-dryrun' } else { '' }))
+    try { Start-Transcript -Path $logPath -Append | Out-Null; $transcriptOn = $true } catch { $transcriptOn = $false }
+}
 
 $hasHyperVCmdlets = [bool](Get-Command New-VM -ErrorAction SilentlyContinue) -and [bool](Get-Command Get-VM -ErrorAction SilentlyContinue)
-$hvFeature = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction SilentlyContinue
+$hvFeature = $null; try { $hvFeature = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction Stop } catch {}   # needs admin; HypervisorPresent covers it otherwise
 $hvFeatureOn = $hvFeature -and ("$($hvFeature.State)" -eq 'Enabled')
 $cs = Get-CimInstance Win32_ComputerSystem
 $hypervisorOn = [bool]$cs.HypervisorPresent
@@ -349,6 +440,11 @@ $target = if ($hvEnabled) { "Hyper-V (fast on this PC)" } else { "VirtualBox" }
 
 try {
     Section "Welcome - let's set up an Ubuntu virtual machine"
+    if ($DryRun) {
+        Write-Host "   DRY RUN: nothing will be created, deleted, converted or downloaded." -ForegroundColor Magenta
+        Write-Host "   The wizard stops before the build and prints what it would have done." -ForegroundColor Magenta
+        if (-not $isAdmin) { Warn "Not running as Administrator: Hyper-V VMs can't be listed, so clash checks only see VirtualBox." }
+    }
     Info "This PC: $([math]::Round($hostRamMB/1024,1)) GB RAM, $hostCpus CPUs"
     Info "Will build on: $target"
 
@@ -366,18 +462,27 @@ try {
     $freeGB = [math]::Round((Get-PSDrive $dl).Free / 1GB, 1)
     $isoP = [bool](Get-ChildItem (Join-Path $WorkDir "ubuntu-*-desktop-amd64.iso") -ErrorAction SilentlyContinue)
     $needGB = if ($isoP) { 12 } else { 20 }
-    if ($freeGB -lt $needGB) { throw "Only $freeGB GB free on ${dl}:. Please free about $needGB GB and rerun." }
-    OK "Free space on ${dl}: $freeGB GB"
-    try { Invoke-WebRequest "https://releases.ubuntu.com/" -UseBasicParsing -TimeoutSec 15 -Method Head | Out-Null } catch { try { Invoke-WebRequest "https://releases.ubuntu.com/" -UseBasicParsing -TimeoutSec 15 | Out-Null } catch { throw "No internet connection to releases.ubuntu.com. Check your connection and rerun." } }
-    OK "Internet connection OK"
+    if ($freeGB -lt $needGB) {
+        $m = "Only $freeGB GB free on ${dl}:. Please free about $needGB GB and rerun."
+        if ($DryRun) { Warn "$m (the real run would stop here)" } else { throw $m }
+    } else { OK "Free space on ${dl}: $freeGB GB" }
+    $online = $true
+    try { Invoke-WebRequest "https://releases.ubuntu.com/" -UseBasicParsing -TimeoutSec 15 -Method Head | Out-Null } catch { try { Invoke-WebRequest "https://releases.ubuntu.com/" -UseBasicParsing -TimeoutSec 15 | Out-Null } catch { $online = $false } }
+    if ($online) { OK "Internet connection OK" }
+    else {
+        $m = "No internet connection to releases.ubuntu.com. Check your connection and rerun."
+        if ($DryRun) { Warn "$m (the real run would stop here)" } else { throw $m }
+    }
 
     # ---- inventory + what to do
     Section "Your existing virtual machines"
     $vbManage = Get-VBoxManage
-    $hvVMs = @(Get-VM -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
-    $vbVMs = @(); if ($vbManage) { $vbVMs = @((& $vbManage list vms) | ForEach-Object { if ($_ -match '^"([^"]+)"') { $Matches[1] } }) }
+    $hvVMs = @(); $hvReadable = $true
+    if ($hasHyperVCmdlets) { try { $hvVMs = @(Get-VM -ErrorAction Stop | Select-Object -ExpandProperty Name) } catch { $hvReadable = $false } }
+    $vbVMs = @(); if ($vbManage) { $vbVMs = @((NativeOut { & $vbManage list vms }) | ForEach-Object { if ($_ -match '^"([^"]+)"') { $Matches[1] } }) }
     $isos = @(Get-ChildItem (Join-Path $WorkDir "ubuntu-*.iso") -ErrorAction SilentlyContinue)
-    if ($hvVMs) { Info ("Hyper-V VMs: " + ($hvVMs -join ', ')) } else { Info "Hyper-V VMs: none" }
+    if (-not $hvReadable) { Warn "Hyper-V VMs: can't read them (needs Administrator)" }
+    elseif ($hvVMs) { Info ("Hyper-V VMs: " + ($hvVMs -join ', ')) } else { Info "Hyper-V VMs: none" }
     if ($vbVMs) { Info ("VirtualBox VMs: " + ($vbVMs -join ', ')) } else { Info "VirtualBox VMs: none" }
     if ($isos) { foreach ($i in $isos) { Info ("Saved ISO: {0} ({1:N0} MB)" -f $i.Name, ($i.Length/1MB)) } } else { Info "Saved ISOs: none" }
     Write-Host ""
@@ -397,10 +502,11 @@ try {
             if ($pk -match '^\d+$' -and [int]$pk -ge 1 -and [int]$pk -le $vbVMs.Count) { $src = $vbVMs[[int]$pk-1] }
             elseif ($vbVMs -contains $pk) { $src = $pk } else { Warn "Enter a number from the list or the exact name." }
         } until ($src)
+        if ($DryRun) { Show-MigratePlan $src $vbManage $WorkDir $MemoryMB $Cpus; Write-Host ""; OK "Dry run finished. Nothing was changed."; return }
         Migrate-VBox $src $vbManage $WorkDir (Ensure-Switch) $MemoryMB $Cpus
         return
     }
-    if ($mode -eq 'd') { Section "Delete old items"; Remove-OldItems $WorkDir $vbManage $hvVMs $vbVMs $isos }
+    if ($mode -eq 'd') { Section "Delete old items"; Remove-OldItems $WorkDir $vbManage $hvVMs $vbVMs $isos $DryRun }
 
     # ---- name
     Section "Name your VM"
@@ -438,7 +544,14 @@ try {
 
     # ---- summary + confirm
     $osText = switch -regex ($UbuntuVersion) { '^\d+\.\d+$' { "Ubuntu $UbuntuVersion (Desktop)" } 'latest' { "Ubuntu (latest release, Desktop)" } default { "Ubuntu (latest LTS, Desktop)" } }
-    Show-Summary $osText $target $MemoryMB $hostRamMB $Cpus $hostCpus $DiskGB $Username $VMName $replaces $replacesWhere
+    $vmDirPreview = Join-Path $WorkDir $VMName
+    $leftoverDir = if (-not $replaces -and (Test-Path $vmDirPreview)) { $vmDirPreview } else { $null }
+    Show-Summary $osText $target $MemoryMB $hostRamMB $Cpus $hostCpus $DiskGB $Username $VMName $replaces $replacesWhere $leftoverDir
+    if ($DryRun) {
+        Show-BuildPlan $hvEnabled $VMName $WorkDir $replaces $replacesWhere $leftoverDir $MemoryMB $Cpus $DiskGB $UbuntuVersion $isos
+        Write-Host ""; OK "Dry run finished at 'Start the build?'. Nothing was changed."
+        return
+    }
     if ((Read-Host "Start the build? (y/n)") -notmatch '^(y|yes)$') { throw "No problem, stopped before building. Rerun whenever you're ready." }
 
     $script:StepNo = 0; $script:StepTotal = 6
@@ -571,7 +684,7 @@ autoinstall:
         VBox unattended install $VMName --iso=$isoPath --user=$Username --password=$Password --full-user-name=$Username --hostname="$VMName.local" --locale=en_US --time-zone=$TimeZone --install-additions --start-vm=gui
         Info "Installing. This runs on its own..."
         $start = Get-Date; $deadline = $start.AddMinutes(90); $installed = $false
-        do { Start-Sleep -Seconds 15; $ga = & $VBoxManage guestproperty get $VMName "/VirtualBox/GuestAdd/Version" 2>$null; $w = (Get-Width) - 1; $ln = ("  {0:hh\:mm\:ss} elapsed" -f ((Get-Date)-$start)); Write-Host ("`r" + $ln.PadRight($w)) -NoNewline; if ($ga -match '^Value:') { $installed = $true; break } } while ((Get-Date) -lt $deadline)
+        do { Start-Sleep -Seconds 15; $ga = NativeOut { & $VBoxManage guestproperty get $VMName "/VirtualBox/GuestAdd/Version" }; $w = (Get-Width) - 1; $ln = ("  {0:hh\:mm\:ss} elapsed" -f ((Get-Date)-$start)); Write-Host ("`r" + $ln.PadRight($w)) -NoNewline; if ($ga -match '^Value:') { $installed = $true; break } } while ((Get-Date) -lt $deadline)
         Write-Host ""
         if (-not $installed) { throw "Install did not complete within 90 minutes. Check the VM window." }
         OK "Ubuntu installed."
@@ -580,7 +693,7 @@ autoinstall:
         VBox storageattach $VMName --storagectl SATA --port 1 --device 0 --type dvddrive --medium emptydrive
         VBox controlvm $VMName acpipowerbutton
         $deadline = (Get-Date).AddMinutes(5)
-        do { Start-Sleep -Seconds 5; $info = & $VBoxManage showvminfo $VMName --machinereadable 2>$null; $state = ($info | Select-String '^VMState=' | Select-Object -First 1).ToString(); if ((Get-Date) -gt $deadline) { VBox controlvm $VMName poweroff } } until ($state -match 'poweroff')
+        do { Start-Sleep -Seconds 5; $info = NativeOut { & $VBoxManage showvminfo $VMName --machinereadable }; $state = ($info | Select-String '^VMState=' | Select-Object -First 1).ToString(); if ((Get-Date) -gt $deadline) { VBox controlvm $VMName poweroff } } until ($state -match 'poweroff')
         VBox snapshot $VMName take clean --description "Clean Ubuntu install"
         VBox startvm $VMName --type gui
 

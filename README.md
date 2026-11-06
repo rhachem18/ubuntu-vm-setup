@@ -73,8 +73,22 @@ You can change any default without editing the file:
 | `-DiskGB`        | `50`              | Virtual disk size. Grows as needed.                 |
 | `-TimeZone`      | `Europe/Lisbon`    | VM time zone.                                        |
 | `-WorkDir`       | `%USERPROFILE%\VMs`| Where ISOs and VMs are stored.                      |
+| `-DryRun`        | off                | Rehearse: walk every prompt, change nothing.        |
 
 You set the password at a prompt when the script runs; it is never stored in the file.
+
+### Rehearse first with `-DryRun`
+
+```powershell
+.\setup-ubuntu-vm.ps1 -DryRun
+```
+
+This walks the whole wizard (checks, your existing VMs, the name and any clash, settings,
+account, summary) and then, instead of asking "Start the build?", prints exactly what it
+*would* do. Move and delete choices are also only described. Nothing is created, deleted,
+converted or downloaded; only a `setup-log-*-dryrun.txt` log is written. It runs without
+Administrator too, but then Hyper-V VMs are invisible to it, so run it elevated to check
+name clashes against Hyper-V.
 
 ## After it finishes
 
