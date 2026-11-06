@@ -48,6 +48,9 @@ $ProgressPreference    = "SilentlyContinue"
 # <user>, <password>): you can see a value was there and follow it through the run, but the
 # real value never reaches the file. The console still shows real values (except the password).
 $script:LogPath = $null
+# Until the save folder is chosen there is no file yet: lines wait here, raw, and are
+# redacted when written (by then more secrets are known).
+$script:LogBuffer = New-Object System.Collections.Generic.List[string]
 $script:Secrets = New-Object System.Collections.ArrayList
 $script:VmLabelNo = 0
 function Add-Secret([string]$value, [string]$kind) {
@@ -68,9 +71,16 @@ function Redact([string]$text, [switch]$PasswordOnly) {
     return $text
 }
 function Write-Log([string]$line) {
-    if (-not $script:LogPath) { return }
+    if (-not $script:LogPath) { if ($null -ne $script:LogBuffer) { $script:LogBuffer.Add($line) }; return }
     # The file is created with a UTF-8 BOM (so PS 5.1 shows the check marks right); appends add none.
     try { [IO.File]::AppendAllText($script:LogPath, (Redact $line) + "`r`n", (New-Object Text.UTF8Encoding($false))) } catch {}
+}
+function Start-Log([string]$dir) {
+    $path = Join-Path $dir ("setup-log-{0:yyyyMMdd-HHmmss}{1}.txt" -f (Get-Date), $(if ($DryRun) { '-dryrun' } else { '' }))
+    [IO.File]::WriteAllBytes($path, [byte[]](0xEF, 0xBB, 0xBF))
+    $script:LogPath = $path
+    $buf = $script:LogBuffer; $script:LogBuffer = $null
+    foreach ($l in $buf) { Write-Log $l }
 }
 # Everything the wizard prints goes through Write-Host, so wrapping it logs the whole run.
 # In-place progress lines (-NoNewline) are console-only.
@@ -187,6 +197,29 @@ function Prompt-VMName($default) {
     } until ($ok)
     return $default
 }
+function Prompt-WorkDir($default) {
+    # Where VMs, the Ubuntu ISO and the logs are saved. Local fixed drives only: Hyper-V
+    # doesn't work well from network shares, and a USB drive can disappear mid-build.
+    $defIso = @(Get-ChildItem (Join-Path $default "ubuntu-*-desktop-amd64.iso") -ErrorAction SilentlyContinue).Count -gt 0
+    $free = try { Format-Size ([IO.DriveInfo](Split-Path -Qualifier $default)).AvailableFreeSpace } catch { '?' }
+    Info ("Recommended: {0}  ({1} free{2})" -f $default, $free, $(if ($defIso) { '; the Ubuntu ISO is already saved here' } else { '' }))
+    while ($true) {
+        $in = (Ask "Folder (press Enter to use $default)").Trim().Trim('"')
+        if (-not $in) { $in = $default }
+        $in = [Environment]::ExpandEnvironmentVariables($in)
+        if ($in -notmatch '^[A-Za-z]:\\') { Warn "Give a full path on a local drive, like D:\VMs."; continue }
+        try { $full = [IO.Path]::GetFullPath($in).TrimEnd('\') } catch { Warn "That isn't a valid folder path."; continue }
+        $drive = try { [IO.DriveInfo]$full.Substring(0, 2) } catch { $null }
+        if (-not $drive -or -not $drive.IsReady) { Warn "Drive $($full.Substring(0, 2)) isn't available."; continue }
+        if ("$($drive.DriveType)" -ne 'Fixed') { Warn "$($full.Substring(0, 2)) is a $($drive.DriveType) drive. Pick a folder on a local fixed drive."; continue }
+        if ($full.Length -le 2) { $full = "$full\VMs"; Info "Using $full, so VM folders don't spread over the drive root." }
+        if (Test-Path -LiteralPath $full -PathType Leaf) { Warn "$full is a file, not a folder."; continue }
+        if ($defIso -and $full -ne $default.TrimEnd('\') -and -not (Get-ChildItem (Join-Path $full "ubuntu-*-desktop-amd64.iso") -ErrorAction SilentlyContinue)) {
+            Warn "The Ubuntu ISO isn't in that folder, so it will be downloaded again (about 6 GB)."
+        }
+        return $full
+    }
+}
 function Prompt-Account($defaultUser) {
     do {
         $in = Ask "Login username (press Enter to use $defaultUser)" -Secret user
@@ -296,13 +329,14 @@ function Choose-Settings($hostRam, $hostCpu, $defMem, $defCpu, $defDisk, $defVer
     }
     return [pscustomobject]@{ Mem = $recMem; Cpu = $recCpu; Disk = $defDisk; Ver = $defVer }
 }
-function Show-Summary($osText, $target, $mem, $hostRam, $cpu, $hostCpu, $disk, $user, $name, $c) {
+function Show-Summary($osText, $target, $saveDir, $mem, $hostRam, $cpu, $hostCpu, $disk, $user, $name, $c) {
     Write-Host ""
     Write-Host $Rule -ForegroundColor Green
     Write-Host "  READY TO BUILD" -ForegroundColor Green
     Write-Host $Rule -ForegroundColor Green
-    # Same order as the questions were asked: where it runs, name, resources, version, login.
+    # Same order as the questions were asked: where it runs and is saved, name, resources, version, login.
     Write-Host ("  Runs on             {0}" -f $target)
+    Write-Host ("  Saved in            {0}" -f $saveDir)
     Write-Host ("  VM name             {0}" -f $name)
     if ($c.HvVM)   { Write-Host ("  DELETES             the Hyper-V VM '{0}'" -f $name) -ForegroundColor Yellow }
     if ($c.VbVM)   { Write-Host ("  DELETES             the VirtualBox VM '{0}' and its disks" -f $name) -ForegroundColor Yellow }
@@ -399,15 +433,9 @@ if (-not $isAdmin -and -not $DryRun) { throw "Please run PowerShell as Administr
 # Names known up front are secrets from the first line of the log.
 Add-Secret $VMName 'vm'; Add-Secret $Username 'user'
 
-# A dry run only writes its log, and only into a WorkDir that already exists.
-if (-not $DryRun) { New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null }
-if (Test-Path $WorkDir) {
-    $logPath = Join-Path $WorkDir ("setup-log-{0:yyyyMMdd-HHmmss}{1}.txt" -f (Get-Date), $(if ($DryRun) { '-dryrun' } else { '' }))
-    [IO.File]::WriteAllBytes($logPath, [byte[]](0xEF, 0xBB, 0xBF))
-    $script:LogPath = $logPath
-    Write-Log ("setup-ubuntu-vm log, started {0:yyyy-MM-dd HH:mm:ss}{1}, PowerShell {2}" -f (Get-Date), $(if ($DryRun) { ' (dry run)' } else { '' }), $PSVersionTable.PSVersion)
-    Write-Log "VM names, the login username and the password are replaced with <vm-N>, <user>, <password>."
-}
+# The log file is created once the save folder is chosen; until then lines are buffered.
+Write-Log ("setup-ubuntu-vm log, started {0:yyyy-MM-dd HH:mm:ss}{1}, PowerShell {2}" -f (Get-Date), $(if ($DryRun) { ' (dry run)' } else { '' }), $PSVersionTable.PSVersion)
+Write-Log "VM names, the login username and the password are replaced with <vm-N>, <user>, <password>."
 
 $hasHyperVCmdlets = [bool](Get-Command New-VM -ErrorAction SilentlyContinue) -and [bool](Get-Command Get-VM -ErrorAction SilentlyContinue)
 $hvFeature = $null; try { $hvFeature = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction Stop } catch {}   # needs admin; HypervisorPresent covers it otherwise
@@ -429,7 +457,6 @@ try {
     Info "Will build on: $target"
 
     $vbManage = Get-VBoxManage
-    $isos = @(Get-ChildItem (Join-Path $WorkDir "ubuntu-*.iso") -ErrorAction SilentlyContinue)
 
     if (-not $hvEnabled -and $hypervisorOn) {
         Write-Host ""
@@ -438,6 +465,15 @@ try {
         Write-Host "     dism /online /enable-feature /featurename:Microsoft-Hyper-V-All /all /norestart"
         if ((Ask "Continue now with VirtualBox (slower)? (y/n)") -notmatch '^(y|yes)$') { Info "Stopped. Enable Hyper-V, reboot, then rerun."; return }
     }
+
+    # ---- where to save (asked first: the space check, ISO reuse and name check all use it)
+    Section "Where to save the VM"
+    if ($PSBoundParameters.ContainsKey('WorkDir')) { $WorkDir = [IO.Path]::GetFullPath($WorkDir).TrimEnd('\'); Info "Using $WorkDir (from -WorkDir)." }
+    else { $WorkDir = Prompt-WorkDir $WorkDir }
+    if (Test-Path -LiteralPath $WorkDir) { Start-Log $WorkDir }
+    elseif ($DryRun) { Would "create the folder $WorkDir"; Info "A dry run doesn't create it, so this run's log isn't saved." ; $script:LogBuffer = $null }
+    else { New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null; OK "Created $WorkDir"; Start-Log $WorkDir }
+    $isos = @(Get-ChildItem (Join-Path $WorkDir "ubuntu-*.iso") -ErrorAction SilentlyContinue)
 
     # ---- checks
     Section "Checking your machine"
@@ -488,7 +524,7 @@ try {
 
     # ---- summary + confirm
     $osText = switch -regex ($UbuntuVersion) { '^\d+\.\d+$' { "Ubuntu $UbuntuVersion (Desktop)" } 'latest' { "Ubuntu (latest release, Desktop)" } default { "Ubuntu (latest LTS, Desktop)" } }
-    Show-Summary $osText $target $MemoryMB $hostRamMB $Cpus $hostCpus $DiskGB $Username $VMName $conflict
+    Show-Summary $osText $target $WorkDir $MemoryMB $hostRamMB $Cpus $hostCpus $DiskGB $Username $VMName $conflict
     if ($DryRun) {
         Show-BuildPlan $hvEnabled $VMName $WorkDir $conflict $MemoryMB $Cpus $DiskGB $UbuntuVersion $isos
         Write-Host ""; OK "Dry run finished at 'Start the build?'. Nothing was changed."

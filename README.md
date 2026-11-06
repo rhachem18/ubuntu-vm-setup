@@ -15,6 +15,8 @@ accept or customize, and a clear summary before it builds anything.
     updates VirtualBox for you if needed.
 - Finds and downloads the **latest Ubuntu LTS Desktop** ISO, and verifies its SHA256 checksum.
 - Installs Ubuntu **unattended** (on Hyper-V you confirm the automated install once).
+- Asks where to save the VM (recommended: `%USERPROFILE%\VMs`, with its free space shown).
+  It must be a folder on a local drive.
 - Creates the VM with your chosen memory, CPUs, and disk, and a login account you set.
 - Takes a **clean snapshot/checkpoint** at the end so you can always roll back.
 - Logs the whole run to `VMs\setup-log-<timestamp>.txt`, with VM names, the login username
@@ -83,7 +85,7 @@ You can change any default without editing the file:
 | `-Cpus`          | `4`                | CPU cores. Auto-capped to fit your host.            |
 | `-DiskGB`        | `50`              | Virtual disk size. Grows as needed.                 |
 | `-TimeZone`      | `Europe/Lisbon`    | VM time zone.                                        |
-| `-WorkDir`       | `%USERPROFILE%\VMs`| Where ISOs and VMs are stored.                      |
+| `-WorkDir`       | `%USERPROFILE%\VMs`| Where VMs, ISOs and logs are saved. Skips the question. |
 | `-DryRun`        | off                | Rehearse: walk every prompt, change nothing.        |
 
 You set the password at a prompt when the script runs; it is never stored in the file.
