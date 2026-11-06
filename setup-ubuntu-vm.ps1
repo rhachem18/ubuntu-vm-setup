@@ -137,7 +137,7 @@ function Get-Sha256WithProgress([string]$path, [string]$label) {
     # ReadWrite sharing: the ISO may be attached to a VM at the same time.
     $fs = [IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
     try {
-        $buf = New-Object byte[] (4MB); $total = [math]::Max(1, $fs.Length); $done = [int64]0; $last = -1
+        $buf = New-Object byte[] (4MB); $total = [math]::Max([int64]1, $fs.Length); $done = [int64]0; $last = -1
         while (($n = $fs.Read($buf, 0, $buf.Length)) -gt 0) {
             [void]$sha.TransformBlock($buf, 0, $n, $null, 0); $done += $n
             $pct = [int][math]::Floor($done * 100 / $total)
