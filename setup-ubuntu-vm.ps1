@@ -180,7 +180,7 @@ function Get-UbuntuIso($UbuntuVersion, $WorkDir) {
 # ---- wizard helpers -------------------------------------------------------
 function Prompt-VMName($default) {
     do {
-        $in = Ask "VM name [$default]" -Secret vm
+        $in = Ask "VM name (press Enter to use $default)" -Secret vm
         if ($in) { $default = $in.Trim() }
         $ok = $default -match '^[A-Za-z0-9._-]+$' -and $default -notmatch '^\.+$'
         if (-not $ok) { Warn "Letters, digits, dot, dash or underscore only (not just dots)." }
@@ -189,7 +189,7 @@ function Prompt-VMName($default) {
 }
 function Prompt-Account($defaultUser) {
     do {
-        $in = Ask "Login username [$defaultUser]" -Secret user
+        $in = Ask "Login username (press Enter to use $defaultUser)" -Secret user
         if ($in) { $defaultUser = $in.Trim() }
         $ok = $defaultUser -match '^[a-z][a-z0-9_-]*$'
         if (-not $ok) { Warn "Lowercase, start with a letter." }
@@ -301,16 +301,17 @@ function Show-Summary($osText, $target, $mem, $hostRam, $cpu, $hostCpu, $disk, $
     Write-Host $Rule -ForegroundColor Green
     Write-Host "  READY TO BUILD" -ForegroundColor Green
     Write-Host $Rule -ForegroundColor Green
-    Write-Host ("  Operating system    {0}" -f $osText)
+    # Same order as the questions were asked: where it runs, name, resources, version, login.
     Write-Host ("  Runs on             {0}" -f $target)
-    Write-Host ("  Memory (RAM)        {0} GB     of your {1} GB" -f [math]::Round($mem/1024,1), [math]::Round($hostRam/1024,1))
-    Write-Host ("  Processors          {0} CPUs    of your {1}" -f $cpu, $hostCpu)
-    Write-Host ("  Disk size           {0} GB    (grows as needed)" -f $disk)
-    Write-Host ("  Login username      {0}" -f $user)
     Write-Host ("  VM name             {0}" -f $name)
     if ($c.HvVM)   { Write-Host ("  DELETES             the Hyper-V VM '{0}'" -f $name) -ForegroundColor Yellow }
     if ($c.VbVM)   { Write-Host ("  DELETES             the VirtualBox VM '{0}' and its disks" -f $name) -ForegroundColor Yellow }
     if ($c.Folder) { Write-Host ("  DELETES             the folder {0}" -f $c.Folder) -ForegroundColor Yellow }
+    Write-Host ("  Memory (RAM)        {0} GB     of your {1} GB" -f [math]::Round($mem/1024,1), [math]::Round($hostRam/1024,1))
+    Write-Host ("  Processors          {0} CPUs    of your {1}" -f $cpu, $hostCpu)
+    Write-Host ("  Disk size           {0} GB    (grows as needed)" -f $disk)
+    Write-Host ("  Operating system    {0}" -f $osText)
+    Write-Host ("  Login username      {0}" -f $user)
     Write-Host ""
     Write-Host "  This takes about 20 to 40 minutes. You can step away once it starts."
     Write-Host $Rule -ForegroundColor Green
