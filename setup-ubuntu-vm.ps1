@@ -42,6 +42,52 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference    = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+# ---- private log --------------------------------------------------------------
+# The run log is written by us, not Start-Transcript, so every line can be redacted first.
+# VM names, the login username and the password become labelled placeholders (<vm-1>,
+# <user>, <password>): you can see a value was there and follow it through the run, but the
+# real value never reaches the file. The console still shows real values (except the password).
+$script:LogPath = $null
+$script:Secrets = New-Object System.Collections.ArrayList
+$script:VmLabelNo = 0
+function Add-Secret([string]$value, [string]$kind) {
+    if (-not $value) { return }
+    foreach ($s in $script:Secrets) { if ($s.Value -eq $value) { return } }
+    $label = switch ($kind) { 'vm' { $script:VmLabelNo++; "<vm-$($script:VmLabelNo)>" } 'user' { '<user>' } default { '<password>' } }
+    [void]$script:Secrets.Add([pscustomobject]@{ Value = $value; Label = $label; Kind = $kind })
+}
+function Redact([string]$text, [switch]$PasswordOnly) {
+    if (-not $text) { return $text }
+    # Longest first, so 'ubuntu-io-dev' is replaced before a shorter name inside it.
+    foreach ($s in ($script:Secrets | Sort-Object { $_.Value.Length } -Descending)) {
+        $esc = [regex]::Escape($s.Value)
+        if ($s.Kind -eq 'password') { $text = [regex]::Replace($text, $esc, $s.Label) }
+        elseif (-not $PasswordOnly) { $text = [regex]::Replace($text, "(?<![A-Za-z0-9._-])$esc(?![A-Za-z0-9_-])", $s.Label, 'IgnoreCase') }
+    }
+    if (-not $PasswordOnly -and $env:USERPROFILE) { $text = [regex]::Replace($text, [regex]::Escape($env:USERPROFILE), '%USERPROFILE%', 'IgnoreCase') }
+    return $text
+}
+function Write-Log([string]$line) {
+    if (-not $script:LogPath) { return }
+    # The file is created with a UTF-8 BOM (so PS 5.1 shows the check marks right); appends add none.
+    try { [IO.File]::AppendAllText($script:LogPath, (Redact $line) + "`r`n", (New-Object Text.UTF8Encoding($false))) } catch {}
+}
+# Everything the wizard prints goes through Write-Host, so wrapping it logs the whole run.
+# In-place progress lines (-NoNewline) are console-only.
+function Write-Host {
+    param([Parameter(Position = 0)]$Object = "", [switch]$NoNewline, $ForegroundColor)
+    Microsoft.PowerShell.Utility\Write-Host @PSBoundParameters
+    if (-not $NoNewline) { Write-Log ("$Object" -replace "^`r", '') }
+}
+# Read-Host plus a log line with the (redacted) answer. -Secret vm|user registers the answer
+# as a secret before it is logged.
+function Ask([string]$prompt, [string]$Secret) {
+    $a = "$(Read-Host $prompt)"
+    if ($Secret -and $a.Trim()) { Add-Secret $a.Trim() $Secret }
+    Write-Log "${prompt}: $a"
+    return $a
+}
+
 # Console width, read live so dividers and redraws fit any window size (prevents text jumping).
 function Get-Width { try { $w = $Host.UI.RawUI.WindowSize.Width } catch { $w = 80 }; if (-not $w -or $w -lt 20) { $w = 80 }; return $w }
 function Rule { return ("-" * [math]::Min(60, (Get-Width) - 1)) }
@@ -134,7 +180,7 @@ function Get-UbuntuIso($UbuntuVersion, $WorkDir) {
 # ---- wizard helpers -------------------------------------------------------
 function Prompt-VMName($default) {
     do {
-        $in = Read-Host "VM name [$default]"
+        $in = Ask "VM name [$default]" -Secret vm
         if ($in) { $default = $in.Trim() }
         $ok = $default -match '^[A-Za-z0-9._-]+$'
         if (-not $ok) { Warn "Letters, digits, dot, dash or underscore only." }
@@ -143,7 +189,7 @@ function Prompt-VMName($default) {
 }
 function Prompt-Account($defaultUser) {
     do {
-        $in = Read-Host "Login username [$defaultUser]"
+        $in = Ask "Login username [$defaultUser]" -Secret user
         if ($in) { $defaultUser = $in.Trim() }
         $ok = $defaultUser -match '^[a-z][a-z0-9_-]*$'
         if (-not $ok) { Warn "Lowercase, start with a letter." }
@@ -151,11 +197,15 @@ function Prompt-Account($defaultUser) {
     do {
         $p1 = Read-Host "Choose a password" -AsSecureString
         $p2 = Read-Host "Confirm password" -AsSecureString
+        Write-Log "Choose a password: <hidden>"; Write-Log "Confirm password: <hidden>"
         $pw1 = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($p1))
         $pw2 = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($p2))
         $bad = ':"''`\'.ToCharArray()
         $hasBad = ($pw1.IndexOfAny($bad) -ge 0) -or ($pw1 -match "[\r\n]")
         $ok = ($pw1 -eq $pw2) -and ($pw1.Length -ge 4) -and (-not $hasBad)
+        # Only the accepted password is registered: it is masked anywhere it appears, from now on,
+        # in the log and in VirtualBox's console output (which echoes it).
+        if ($ok) { Add-Secret $pw1 'password' }
         if (-not $ok) { Warn "Passwords must match, be 4+ chars, and avoid : `" ' `` \ and newlines." }
     } until ($ok)
     return [pscustomobject]@{ User = $defaultUser; Password = $pw1 }
@@ -171,9 +221,19 @@ function Get-ExistingVMSettings($name, $hvEnabled, $vbManage) {
     if ($vbManage) {
         $info = NativeOut { & $vbManage showvminfo $name --machinereadable }
         if ($LASTEXITCODE -eq 0 -and $info) {
-            $mem = 0; $cpu = 0
-            foreach ($l in $info) { if ($l -match '^memory=(\d+)') { $mem = [int]$Matches[1] }; if ($l -match '^cpus=(\d+)') { $cpu = [int]$Matches[1] } }
-            if ($mem -gt 0) { return [pscustomobject]@{ Found = $true; Where = 'VirtualBox'; Mem = $mem; Cpu = $cpu; Disk = $null } }
+            $mem = 0; $cpu = 0; $diskPath = $null
+            foreach ($l in $info) {
+                if ($l -match '^memory=(\d+)') { $mem = [int]$Matches[1] }
+                if ($l -match '^cpus=(\d+)') { $cpu = [int]$Matches[1] }
+                # First attached hard disk, e.g. "SATA-0-0"="C:\...\name.vdi"
+                if (-not $diskPath -and $l -match '^"[^"]+-\d+-\d+"="(.+\.(vdi|vhdx?|vmdk))"$') { $diskPath = $Matches[1] -replace '\\\\', '\' }
+            }
+            $disk = $null
+            if ($diskPath) {
+                $mi = NativeOut { & $vbManage showmediuminfo disk $diskPath }
+                foreach ($l in $mi) { if ($l -match '^Capacity:\s*(\d+)\s*MBytes') { $disk = [int][math]::Round([int64]$Matches[1] / 1024) } }
+            }
+            if ($mem -gt 0) { return [pscustomobject]@{ Found = $true; Where = 'VirtualBox'; Mem = $mem; Cpu = $cpu; Disk = $disk } }
         }
     }
     return [pscustomobject]@{ Found = $false }
@@ -187,7 +247,7 @@ function Show-SettingsTable($label, $mem, $cpu, $disk, $hostRam, $hostCpu) {
 }
 function Read-IntOr($prompt, $default, $min, $max) {
     while ($true) {
-        $in = (Read-Host ("$prompt [$default]")).Trim()
+        $in = (Ask ("$prompt [$default]")).Trim()
         if (-not $in) { return $default }
         if ($in -match '^\d+$') {
             $v = [int]$in
@@ -211,7 +271,7 @@ function Choose-Settings($hostRam, $hostCpu, $defMem, $defCpu, $defDisk, $defVer
     if ($existing.Found) { Write-Host "     [e] Reuse your existing VM's size" }
     Write-Host "     [c] Customize each setting"
     $choices = if ($existing.Found) { "r/e/c" } else { "r/c" }
-    $pick = (Read-Host "Choice ($choices)").Trim().ToLower()
+    $pick = (Ask "Choice ($choices)").Trim().ToLower()
     if (-not $pick) { $pick = 'r' }
 
     if ($pick -eq 'e' -and $existing.Found) {
@@ -223,7 +283,7 @@ function Choose-Settings($hostRam, $hostCpu, $defMem, $defCpu, $defDisk, $defVer
         $mem = Read-IntOr "Memory in MB (1024 = 1 GB)" $recMem 2048 $maxMem
         $cpu = Read-IntOr "Number of CPUs" $recCpu 1 $maxCpu
         $disk = Read-IntOr "Disk size in GB" $defDisk 25 4096
-        $verIn = (Read-Host "Ubuntu version: lts / latest / a number like 24.04 [$defVer]").Trim()
+        $verIn = (Ask "Ubuntu version: lts / latest / a number like 24.04 [$defVer]").Trim()
         if (-not $verIn) { $verIn = $defVer }
         return [pscustomobject]@{ Mem = $mem; Cpu = $cpu; Disk = $disk; Ver = $verIn }
     }
@@ -369,10 +429,10 @@ function Remove-OldItems($WorkDir, $vbManage, $hvVMs, $vbVMs, $isos, [bool]$DryR
     Write-Host "     [v] A specific VM by name"
     Write-Host "     [a] EVERYTHING under $WorkDir (all VMs + ISOs, keeps logs)"
     Write-Host "     [n] Nothing, continue"
-    $d = (Read-Host "Choice (i/v/a/n)").Trim().ToLower()
+    $d = (Ask "Choice (i/v/a/n)").Trim().ToLower()
     $name = $null
     if ($d -eq 'v') {
-        $name = (Read-Host "VM name to delete").Trim()
+        $name = (Ask "VM name to delete" -Secret vm).Trim()
         # An empty name would make Join-Path point at $WorkDir itself and wipe every VM folder.
         if (-not $name -or $name -notmatch '^[A-Za-z0-9._-]+$' -or $name -match '^\.+$') { Info "No valid VM name given. Nothing deleted."; return }
     }
@@ -388,7 +448,7 @@ function Remove-OldItems($WorkDir, $vbManage, $hvVMs, $vbVMs, $isos, [bool]$DryR
             }
             'a' {
                 Warn "This permanently deletes ALL VMs and ISOs under $WorkDir."
-                if ((Read-Host "Type 'yes' to confirm") -ne 'yes') { Info "Skipped."; return }
+                if ((Ask "Type 'yes' to confirm") -ne 'yes') { Info "Skipped."; return }
                 foreach ($n in $hvVMs) { Would "turn off and remove the Hyper-V VM '$n'" }
                 foreach ($n in $vbVMs) { Would "power off and unregister the VirtualBox VM '$n', deleting its disks" }
                 foreach ($f in @(Get-ChildItem $WorkDir -Exclude "setup-log-*.txt" -ErrorAction SilentlyContinue)) { Would "delete $($f.FullName)" }
@@ -407,7 +467,7 @@ function Remove-OldItems($WorkDir, $vbManage, $hvVMs, $vbVMs, $isos, [bool]$DryR
         }
         'a' {
             Warn "This permanently deletes ALL VMs and ISOs under $WorkDir."
-            if ((Read-Host "Type 'yes' to confirm") -ne 'yes') { Info "Skipped."; return }
+            if ((Ask "Type 'yes' to confirm") -ne 'yes') { Info "Skipped."; return }
             foreach ($n in $hvVMs) { Stop-VM $n -TurnOff -Force -ErrorAction SilentlyContinue; Remove-VM $n -Force -ErrorAction SilentlyContinue }
             if ($vbManage) { foreach ($n in $vbVMs) { Native { & $vbManage controlvm $n poweroff } | Out-Null; Native { & $vbManage unregistervm $n --delete } | Out-Null } }
             Get-ChildItem $WorkDir -Exclude "setup-log-*.txt" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
@@ -421,12 +481,17 @@ function Remove-OldItems($WorkDir, $vbManage, $hvVMs, $vbVMs, $isos, [bool]$DryR
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin -and -not $DryRun) { throw "Please run PowerShell as Administrator, then run this again. (Or add -DryRun to rehearse without changing anything.)" }
 
+# Names known up front are secrets from the first line of the log.
+Add-Secret $VMName 'vm'; Add-Secret $Username 'user'
+
 # A dry run only writes its log, and only into a WorkDir that already exists.
-$transcriptOn = $false
 if (-not $DryRun) { New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null }
 if (Test-Path $WorkDir) {
     $logPath = Join-Path $WorkDir ("setup-log-{0:yyyyMMdd-HHmmss}{1}.txt" -f (Get-Date), $(if ($DryRun) { '-dryrun' } else { '' }))
-    try { Start-Transcript -Path $logPath -Append | Out-Null; $transcriptOn = $true } catch { $transcriptOn = $false }
+    [IO.File]::WriteAllBytes($logPath, [byte[]](0xEF, 0xBB, 0xBF))
+    $script:LogPath = $logPath
+    Write-Log ("setup-ubuntu-vm log, started {0:yyyy-MM-dd HH:mm:ss}{1}, PowerShell {2}" -f (Get-Date), $(if ($DryRun) { ' (dry run)' } else { '' }), $PSVersionTable.PSVersion)
+    Write-Log "VM names, the login username and the password are replaced with <vm-N>, <user>, <password>."
 }
 
 $hasHyperVCmdlets = [bool](Get-Command New-VM -ErrorAction SilentlyContinue) -and [bool](Get-Command Get-VM -ErrorAction SilentlyContinue)
@@ -453,7 +518,7 @@ try {
         Warn "A hypervisor (likely VBS/Credential Guard) is on but Hyper-V is off, so VirtualBox will be slow here."
         Warn "For full speed, enable Hyper-V (one reboot) then rerun:"
         Write-Host "     dism /online /enable-feature /featurename:Microsoft-Hyper-V-All /all /norestart"
-        if ((Read-Host "Continue now with VirtualBox (slower)? (y/n)") -notmatch '^(y|yes)$') { throw "Stopped. Enable Hyper-V, reboot, then rerun." }
+        if ((Ask "Continue now with VirtualBox (slower)? (y/n)") -notmatch '^(y|yes)$') { throw "Stopped. Enable Hyper-V, reboot, then rerun." }
     }
 
     # ---- checks
@@ -481,6 +546,7 @@ try {
     if ($hasHyperVCmdlets) { try { $hvVMs = @(Get-VM -ErrorAction Stop | Select-Object -ExpandProperty Name) } catch { $hvReadable = $false } }
     $vbVMs = @(); if ($vbManage) { $vbVMs = @((NativeOut { & $vbManage list vms }) | ForEach-Object { if ($_ -match '^"([^"]+)"') { $Matches[1] } }) }
     $isos = @(Get-ChildItem (Join-Path $WorkDir "ubuntu-*.iso") -ErrorAction SilentlyContinue)
+    foreach ($n in @($hvVMs) + @($vbVMs)) { Add-Secret $n 'vm' }
     if (-not $hvReadable) { Warn "Hyper-V VMs: can't read them (needs Administrator)" }
     elseif ($hvVMs) { Info ("Hyper-V VMs: " + ($hvVMs -join ', ')) } else { Info "Hyper-V VMs: none" }
     if ($vbVMs) { Info ("VirtualBox VMs: " + ($vbVMs -join ', ')) } else { Info "VirtualBox VMs: none" }
@@ -491,17 +557,18 @@ try {
     $canMigrate = $hvEnabled -and $vbVMs
     if ($canMigrate) { Write-Host "     [m] Move a VirtualBox VM onto Hyper-V (keeps the original)" }
     Write-Host "     [d] Delete old VMs or ISOs first"
-    $mode = (Read-Host "Choice (c$(if($canMigrate){'/m'})/d)").Trim().ToLower(); if (-not $mode) { $mode = 'c' }
+    $mode = (Ask "Choice (c$(if($canMigrate){'/m'})/d)").Trim().ToLower(); if (-not $mode) { $mode = 'c' }
 
     if ($mode -eq 'm' -and $canMigrate) {
         Write-Host "   VirtualBox VMs you can move:"
         for ($k = 0; $k -lt $vbVMs.Count; $k++) { Write-Host ("     [{0}] {1}" -f ($k+1), $vbVMs[$k]) }
         $src = $null
         do {
-            $pk = (Read-Host "Enter the number or exact name").Trim()
+            $pk = (Ask "Enter the number or exact name").Trim()
             if ($pk -match '^\d+$' -and [int]$pk -ge 1 -and [int]$pk -le $vbVMs.Count) { $src = $vbVMs[[int]$pk-1] }
             elseif ($vbVMs -contains $pk) { $src = $pk } else { Warn "Enter a number from the list or the exact name." }
         } until ($src)
+        Add-Secret "$src-hv" 'vm'
         if ($DryRun) { Show-MigratePlan $src $vbManage $WorkDir $MemoryMB $Cpus; Write-Host ""; OK "Dry run finished. Nothing was changed."; return }
         Migrate-VBox $src $vbManage $WorkDir (Ensure-Switch) $MemoryMB $Cpus
         return
@@ -521,7 +588,7 @@ try {
         }
         Write-Host "     [r] Replace it (deletes the $($existing.Where) VM '$VMName')"
         Write-Host "     [n] Pick a different name (keeps it)"
-        $clash = (Read-Host "Choice (r/n)").Trim().ToLower()
+        $clash = (Ask "Choice (r/n)").Trim().ToLower()
         if ($clash -eq 'r') { break }
         Write-Host ""
         $VMName = Prompt-VMName $VMName
@@ -552,7 +619,7 @@ try {
         Write-Host ""; OK "Dry run finished at 'Start the build?'. Nothing was changed."
         return
     }
-    if ((Read-Host "Start the build? (y/n)") -notmatch '^(y|yes)$') { throw "No problem, stopped before building. Rerun whenever you're ready." }
+    if ((Ask "Start the build? (y/n)") -notmatch '^(y|yes)$') { throw "No problem, stopped before building. Rerun whenever you're ready." }
 
     $script:StepNo = 0; $script:StepTotal = 6
 
@@ -611,6 +678,8 @@ autoinstall:
         $sd = "$($part.DriveLetter):"
         Copy-Item $udPath "$sd\user-data" -Force; Copy-Item $mdPath "$sd\meta-data" -Force
         Dismount-VHD -Path $seedVhd
+        # The seed disk now carries these; don't leave the plaintext password in the VM folder.
+        Remove-Item $udPath, $mdPath -Force -ErrorAction SilentlyContinue
         OK "Install settings prepared."
 
         Step "Creating the virtual machine"
@@ -665,7 +734,7 @@ autoinstall:
             $ErrorActionPreference = $prev; $VBoxManage = Get-VBoxManage
         }
         OK "Using VirtualBox"
-        function VBox { $prevEAP = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; try { $out = & $VBoxManage @args 2>&1 } finally { $ErrorActionPreference = $prevEAP }; foreach ($line in $out) { $t = "$line".Trim(); if ($t) { Write-Host "     $t" -ForegroundColor DarkGray } }; if ($LASTEXITCODE -ne 0) { throw "VBoxManage $($args[0]) failed (exit $LASTEXITCODE)." } }
+        function VBox { $prevEAP = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; try { $out = & $VBoxManage @args 2>&1 } finally { $ErrorActionPreference = $prevEAP }; foreach ($line in $out) { $t = "$line".Trim(); if ($t) { Write-Host ("     " + (Redact $t -PasswordOnly)) -ForegroundColor DarkGray } }; if ($LASTEXITCODE -ne 0) { throw "VBoxManage $($args[0]) failed (exit $LASTEXITCODE)." } }
         if ($replaces) { Native { & $VBoxManage closemedium disk (Join-Path $WorkDir "$VMName\$VMName.vdi") --delete } | Out-Null; Remove-NamedVM $VMName $WorkDir $VBoxManage }
 
         Step "Downloading Ubuntu"
@@ -703,6 +772,10 @@ autoinstall:
         Write-Host "   Reset: & `"$VBoxManage`" snapshot $VMName restore clean"
     }
 }
+catch {
+    Write-Log ""; Write-Log ("STOPPED: " + $_.Exception.Message)
+    throw
+}
 finally {
-    if ($transcriptOn) { try { Stop-Transcript | Out-Null; Write-Host "`nA log of this run was saved to $logPath" -ForegroundColor DarkGray } catch {} }
+    if ($script:LogPath) { Microsoft.PowerShell.Utility\Write-Host "`nA log of this run (names and password masked) was saved to $($script:LogPath)" -ForegroundColor DarkGray }
 }

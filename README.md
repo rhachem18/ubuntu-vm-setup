@@ -17,7 +17,9 @@ accept or customize, and a clear summary before it builds anything.
 - Installs Ubuntu **unattended** (on Hyper-V you confirm the automated install once).
 - Creates the VM with your chosen memory, CPUs, and disk, and a login account you set.
 - Takes a **clean snapshot/checkpoint** at the end so you can always roll back.
-- Logs the whole run to `VMs\setup-log-<timestamp>.txt`.
+- Logs the whole run to `VMs\setup-log-<timestamp>.txt`, with VM names, the login username
+  and the password replaced by placeholders (`<vm-1>`, `<user>`, `<password>`), so the log is
+  safe to share when asking for help.
 
 It can also move an existing VirtualBox VM onto Hyper-V, and clean up old VMs and ISOs.
 
