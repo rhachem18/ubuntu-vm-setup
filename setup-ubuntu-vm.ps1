@@ -721,6 +721,150 @@ function Invoke-Migrate {
     if ($DryRun) { Show-MigratePlan $src $vbManage $WorkDir $MemoryMB $Cpus; Write-Host ""; OK "Dry run: nothing was changed."; return }
     Migrate-VBox $src $vbManage $WorkDir (Ensure-Switch) $MemoryMB $Cpus
 }
+# ---- doctor (read-only) ----------------------------------------------------------
+function Format-Size([double]$bytes) { if ($bytes -lt 1GB) { "{0:N0} MB" -f ($bytes/1MB) } else { "{0:N1} GB" -f ($bytes/1GB) } }
+function Get-DiskUsedBytes([string]$dir, [string[]]$files) {
+    # Disk bytes in the VM's own folder, so snapshot/checkpoint layers count too. If the disk
+    # sits straight in WorkDir (or a drive root), only count the attached files, or we'd add up
+    # every other VM's disks as well.
+    $exts = '.vdi', '.vhd', '.vhdx', '.avhdx', '.vmdk'
+    if ($dir -and (Test-Path -LiteralPath $dir) -and $dir.TrimEnd('\') -ne $WorkDir.TrimEnd('\') -and (Split-Path $dir -Parent)) {
+        $sum = 0
+        foreach ($f in @(Get-ChildItem -LiteralPath $dir -Recurse -File -ErrorAction SilentlyContinue)) { if ($f.Extension -in $exts -and $f.Name -ne 'seed.vhdx') { $sum += $f.Length } }
+        return $sum
+    }
+    $sum = 0; foreach ($p in $files) { if ($p -and (Test-Path -LiteralPath $p)) { $sum += (Get-Item -LiteralPath $p).Length } }
+    return $sum
+}
+function Get-HvHealth($name) {
+    $vm = Get-VM -Name $name -ErrorAction Stop
+    $drives = @($vm | Get-VMHardDiskDrive -ErrorAction SilentlyContinue)
+    $seed = @($drives | Where-Object { $_.Path -like '*\seed.vhdx' })
+    $os = $drives | Where-Object { $_.Path -notlike '*\seed.vhdx' } | Select-Object -First 1
+    $cap = $null; if ($os) { try { $cap = (Get-VHD -Path $os.Path -ErrorAction Stop).Size } catch {} }
+    $dirs = @("$($vm.Path)"); if ($os) { $dirs += Split-Path $os.Path -Parent }
+    [pscustomobject]@{
+        Name = $name; Where = 'Hyper-V'; State = "$($vm.State)".ToLower(); Running = ("$($vm.State)" -ne 'Off'); Aborted = $false
+        MemMB = [int]($vm.MemoryStartup / 1MB); Cpus = $vm.ProcessorCount
+        DiskPath = $(if ($os) { $os.Path }); CapBytes = $cap
+        UsedBytes = $(if ($os) { Get-DiskUsedBytes (Split-Path $os.Path -Parent) @($os.Path) } else { 0 })
+        Snapshots = @($vm | Get-VMSnapshot -ErrorAction SilentlyContinue).Count; SnapWord = 'checkpoint'
+        Media = @($vm | Get-VMDvdDrive -ErrorAction SilentlyContinue | Where-Object Path | ForEach-Object { Split-Path $_.Path -Leaf })
+        SeedLeft = [bool]$seed; Unattended = 0; Dirs = $dirs
+    }
+}
+function Get-VbHealth($name) {
+    $info = NativeOut { & $vbManage showvminfo $name --machinereadable }
+    if ($LASTEXITCODE -ne 0 -or -not $info) { throw "VBoxManage could not read it" }
+    $state = '?'; $mem = 0; $cpu = 0; $cfg = $null; $disks = @(); $media = @()
+    foreach ($l in $info) {
+        if ($l -match '^VMState="([^"]+)"') { $state = $Matches[1] }
+        elseif ($l -match '^memory=(\d+)') { $mem = [int]$Matches[1] }
+        elseif ($l -match '^cpus=(\d+)') { $cpu = [int]$Matches[1] }
+        elseif ($l -match '^CfgFile="(.+)"$') { $cfg = $Matches[1] -replace '\\\\', '\' }
+        # Attachments look like "SATA-0-0"="C:\\...\\disk.vdi"; "none"/"emptydrive" are empty slots.
+        elseif ($l -match '^"[^"]+-\d+-\d+"="(.+)"$') {
+            $p = $Matches[1] -replace '\\\\', '\'
+            if ($p -match '\.(vdi|vhdx?|vmdk)$') { $disks += $p } elseif ($p -match '\.(iso|viso|dmg)$') { $media += (Split-Path $p -Leaf) }
+        }
+    }
+    $cap = $null
+    if ($disks) { foreach ($l in (NativeOut { & $vbManage showmediuminfo disk $disks[0] })) { if ($l -match '^Capacity:\s*(\d+)\s*MBytes') { $cap = [int64]$Matches[1] * 1MB } } }
+    $snaps = @((NativeOut { & $vbManage snapshot $name list --machinereadable }) | Where-Object { $_ -match '^SnapshotName' }).Count
+    $dir = if ($cfg) { Split-Path $cfg -Parent } else { $null }
+    $unatt = if ($dir -and (Test-Path -LiteralPath $dir)) { @(Get-ChildItem -LiteralPath $dir -Filter 'Unattended-*' -File -ErrorAction SilentlyContinue).Count } else { 0 }
+    $stateText = switch ($state) { 'poweroff' { 'off' } 'saved' { 'saved (suspended)' } default { $state } }
+    [pscustomobject]@{
+        Name = $name; Where = 'VirtualBox'; State = $stateText; Running = ($state -notin 'poweroff', 'aborted', 'saved'); Aborted = ($state -eq 'aborted')
+        MemMB = $mem; Cpus = $cpu; DiskPath = $(if ($disks) { $disks[0] }); CapBytes = $cap
+        UsedBytes = $(if ($disks) { Get-DiskUsedBytes $dir $disks } else { 0 })
+        Snapshots = $snaps; SnapWord = 'snapshot'; Media = $media; SeedLeft = $false; Unattended = $unatt; Dirs = @($dir)
+    }
+}
+function Show-VMHealth($h) {
+    Write-Host ""
+    Write-Host ("   {0}  ({1})" -f $h.Name, $h.Where) -ForegroundColor White
+    Write-Host ("     State            {0}" -f $h.State)
+    Write-Host ("     Memory, CPUs     {0} MB, {1} CPUs" -f $h.MemMB, $h.Cpus)
+    $capText = if ($h.CapBytes) { Format-Size $h.CapBytes } else { 'unknown size' }
+    if ($h.DiskPath) { Write-Host ("     Disk             {0} used of {1}" -f (Format-Size $h.UsedBytes), $capText) } else { Write-Host "     Disk             none attached" }
+    Write-Host ("     {0,-17}{1}" -f ($h.SnapWord.Substring(0,1).ToUpper() + $h.SnapWord.Substring(1) + 's'), $(if ($h.Snapshots) { $h.Snapshots } else { 'none' }))
+    Write-Host ("     Install media    {0}" -f $(if ($h.Media) { 'attached: ' + ($h.Media -join ', ') } else { 'none' }))
+    $n = 0
+    function Flag($m) { Warn $m; Set-Variable -Name n -Value ($n + 1) -Scope 1 }
+    $empty = $h.DiskPath -and $h.UsedBytes -lt 1GB
+    if (-not $h.DiskPath) { Flag "It has no disk attached, so it can't boot." }
+    elseif (-not (Test-Path -LiteralPath $h.DiskPath)) { Flag "Its disk file is missing: $($h.DiskPath)" }
+    elseif ($empty) {
+        Flag ("Its disk is almost empty ({0} used), so Ubuntu was never fully installed{1}." -f (Format-Size $h.UsedBytes), $(if ($h.Running) { ' (unless the install is running right now)' } else { '' }))
+        Write-Host "       Fix: delete it with [3] and create it again with [1]."
+    }
+    if ($h.Media) { Flag "Install media is still attached. After the install the VM can boot back into the installer; eject it." }
+    if ($h.SeedLeft) { Flag "The install seed disk (seed.vhdx) is still attached. It holds the login password in plain text." }
+    if ($h.Unattended) { Flag "$($h.Unattended) unattended-install files are still in its folder. They can hold the login password in plain text." }
+    if ($h.Aborted) { Flag "It crashed or was killed the last time it ran." }
+    if (-not $h.Snapshots -and -not $empty -and $h.DiskPath) { Flag "No $($h.SnapWord), so there is nothing to roll back to." }
+    if ($h.Where -eq 'VirtualBox' -and $hypervisorOn) {
+        if ($hvEnabled) { Flag "It runs on VirtualBox on top of the Windows hypervisor, which is slow here. [5] can move it to Hyper-V." }
+        else { Flag "It runs on VirtualBox on top of the Windows hypervisor, which is slow here. Enabling Hyper-V would be faster." }
+    }
+    if (-not $n) { OK "No problems found." }
+    return $n
+}
+function Invoke-Doctor {
+    # Pure diagnosis: reads VM settings and file sizes, changes nothing (so no -DryRun branch).
+    Info "This only reads; nothing is changed."
+    $issues = 0
+    Write-Host ""; Write-Host "   This PC" -ForegroundColor White
+    $dl = (Split-Path -Qualifier $WorkDir).TrimEnd(':')
+    $free = (Get-PSDrive $dl).Free
+    Write-Host ("     {0,-17}{1}" -f "Free on ${dl}:", (Format-Size $free))
+    if ($free -lt 20GB) { Warn "Less than 20 GB free on ${dl}:. A new VM needs about 20 GB."; $issues++ }
+    if ($hvEnabled) { Write-Host "     Hypervisor       Hyper-V is on" }
+    elseif ($hypervisorOn) { Write-Host "     Hypervisor       on (VBS/Credential Guard), but Hyper-V is off"; Warn "VirtualBox VMs run slowly here. Enabling Hyper-V would be faster."; $issues++ }
+    else { Write-Host "     Hypervisor       none (VirtualBox runs at full speed)" }
+    foreach ($i in $isos) { Write-Host ("     Saved ISO        {0} ({1})" -f $i.Name, (Format-Size $i.Length)) }
+
+    $usedDirs = @(); $hvChecked = $false
+    if (-not $hasHyperVCmdlets) { }
+    elseif (-not $hvReadable) { Write-Host ""; Warn "Hyper-V VMs: can't read them. Run PowerShell as Administrator to check them too."; $issues++ }
+    else {
+        $hvChecked = $true
+        foreach ($n in $hvVMs) {
+            try { $h = Get-HvHealth $n; $issues += Show-VMHealth $h; $usedDirs += $h.Dirs }
+            catch { Write-Host ""; Warn "Hyper-V VM '$n': can't read it ($($_.Exception.Message))"; $issues++ }
+        }
+    }
+    if ($vbManage) {
+        foreach ($n in $vbVMs) {
+            try { $h = Get-VbHealth $n; $issues += Show-VMHealth $h; $usedDirs += $h.Dirs }
+            catch { Write-Host ""; Warn "VirtualBox VM '$n': can't read it ($($_.Exception.Message))"; $issues++ }
+        }
+    }
+    if (-not $hvVMs -and -not $vbVMs) { Write-Host ""; Info "No VMs found." }
+
+    # Folders under WorkDir that no VM uses (left behind by a failed build or a manual delete).
+    $orphans = @()
+    foreach ($d in @(Get-ChildItem -LiteralPath $WorkDir -Directory -ErrorAction SilentlyContinue)) {
+        $f = $d.FullName.TrimEnd('\')
+        $used = $false
+        foreach ($u in $usedDirs) { if ($u -and ($u.TrimEnd('\') -eq $f -or $u.StartsWith("$f\", [StringComparison]::OrdinalIgnoreCase))) { $used = $true } }
+        if (-not $used) { $orphans += $d }
+    }
+    if ($orphans) {
+        Write-Host ""; Write-Host "   Folders in $WorkDir that no VM uses" -ForegroundColor White
+        foreach ($d in $orphans) {
+            Add-Secret $d.Name 'vm'
+            $size = 0; foreach ($f in @(Get-ChildItem -LiteralPath $d.FullName -Recurse -File -ErrorAction SilentlyContinue)) { $size += $f.Length }
+            Warn ("{0} ({1}){2}" -f $d.Name, (Format-Size $size), $(if ($hvChecked -or -not $hasHyperVCmdlets) { '' } else { ", not used by VirtualBox; Hyper-V couldn't be checked" }))
+            $issues++
+        }
+        Write-Host "       These are usually left over from a failed build. [3] can delete them."
+    }
+
+    Write-Host ""
+    if ($issues) { Warn "$issues thing(s) worth a look." } else { OK "Everything looks healthy." }
+}
 function Update-Inventory {
     # Re-read every time the menu is shown, so it reflects what the last action changed.
     $script:vbManage = Get-VBoxManage
@@ -789,7 +933,7 @@ try {
         elseif ($mode -eq '1') { Invoke-Create }
         elseif ($mode -eq '2') { Section "Rename a VM"; Info "Not available yet." }
         elseif ($mode -eq '3') { Section "Delete VMs or ISOs"; Remove-OldItems $WorkDir $vbManage $hvVMs $vbVMs $isos $DryRun }
-        elseif ($mode -eq '4') { Section "Doctor"; Info "Not available yet." }
+        elseif ($mode -eq '4') { Section "Doctor: health check"; Invoke-Doctor }
         elseif ($mode -eq '5' -and $canMigrate) { Section "Move a VirtualBox VM to Hyper-V"; Invoke-Migrate }
         else { Warn "Pick one of the numbers shown, or q to quit." }
     }
